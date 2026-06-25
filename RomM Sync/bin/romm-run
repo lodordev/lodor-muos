@@ -1,0 +1,34 @@
+#!/bin/sh
+# romm-run <engine-args...> - bridge between the RomM Sync app and the headless engine.
+# Brings Wi-Fi up (leaning on muOS's stock path), sets the clock (bounded), then runs the
+# CGO-free static engine with the env it needs. Unlike the MinUI build there is NO SDL/
+# lib32 baggage - the engine is a static arm64 binary. Logs every step.  MARKER: LODOR_RUN
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SELF_DIR/../lib/romm-sync-lib.sh"
+lodor_export_env
+
+# Redact a Wi-Fi PSK if one is ever passed; log the action line otherwise.
+log "=== invoke: $1 ==="
+[ -x "$BIN" ] || { log "FATAL engine missing: $BIN"; echo "RESULT error=engine_missing"; exit 3; }
+
+# Actions that need the network. Local-only actions (none currently) would skip bring-up.
+case "$1" in
+	--set-server|-set-server) ;;   # purely local: writes config, no network
+	*)
+		if ! wifi_bring_up; then
+			log "wifi_bring_up FAILED - leaving engine unrun"
+			exit 2   # lib already wrote the honest failure phase line
+		fi
+		set_clock_bounded
+		phase "Reaching your server..."   # true: we are verified-online here
+		;;
+esac
+
+cd "$DATA_DIR" 2>/dev/null || { log "WARN cd $DATA_DIR failed"; }
+out="$("$BIN" "$@" 2>&1)"; rc=$?
+printf '%s\n' "$out"
+printf '%s\n' "$out" >> "$LOG"
+# Mirror --sync-feed to the file the app reads (kept for parity with the MinUI flow).
+[ "$1" = "--sync-feed" ] && printf '%s\n' "$out" > /tmp/lodor-feed.txt 2>/dev/null
+log "engine exit rc=$rc"
+exit $rc
