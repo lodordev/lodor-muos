@@ -75,7 +75,7 @@ if [ -d "$INIT_DIR" ] || mkdir -p "$INIT_DIR" 2>/dev/null; then
 	if [ ! -f "$INIT_DIR/00-lodor.sh" ]; then
 		cat > "$INIT_DIR/00-lodor.sh" <<EOF
 #!/bin/sh
-# Lodor RomM Sync boot hook (re-healed by lodor-seed.sh; delete to disable autostart).
+# Lodor Sync boot hook (re-healed by lodor-seed.sh; delete to disable autostart).
 "$APPDIR/bin/lodor-seed.sh" >/dev/null 2>&1     # refresh launch overrides
 "$APPDIR/bin/romm-syncd" &                       # start the charging-gated save daemon
 EOF

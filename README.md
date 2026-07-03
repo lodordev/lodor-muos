@@ -1,46 +1,89 @@
-# Lodor for muOS
+# Lodor Sync for muOS
 
-A [muOS](https://muos.dev) application that brings [Lodor](https://github.com/lodordev/lodor)'s
-transparent RomM library to muOS handhelds — your whole [RomM](https://github.com/rommapp/romm)
-library appears as zero-byte stubs, games download when you launch them, and saves sync back to the
-server automatically around each session.
+A **no-fork** [RomM](https://github.com/rommapp/romm) client for stock
+[muOS](https://muos.dev) (MustardOS). Wireless library mirroring, download-on-launch,
+and automatic save sync — delivered entirely through muOS's own extension surfaces
+(an Application, launch overrides, and a boot-init hook). Stock muOS stays stock:
+nothing in the firmware is patched or replaced.
 
-**This is a no-fork add-on.** It's our own application that runs *on* muOS and uses muOS's standard
-app conventions (`mux_launch.sh`, `.muxapp`). It does **not** modify, fork, or redistribute muOS
-itself — you install muOS yourself, then drop this app in.
+Validated target: Anbernic RG34XX (Allwinner H700, arm64) on muOS 2601 "Jacaranda".
 
-## What's here
+## What it does
 
-```
-RomM Sync/
-  mux_launch.sh          muOS app entry point
-  lib/romm-sync-lib.sh   shared sync library (Wi-Fi, clock, run)
-  bin/                   helpers: launch override, seed, run, periodic sync daemon
-  config.json.example    copy to config.json with your server + paired token
-  glyph/romm.png         menu glyph
-```
+- **Mirror your RomM library** — every game on your server appears in the muOS menus
+  (0-byte stubs for games not yet on the card), with box art.
+- **Download on launch** — pick a game you don't have; it downloads over Wi-Fi
+  (hash-verified), then launches. Already-downloaded games launch instantly, offline.
+- **Automatic save sync** — saves are pulled before play and pushed after (or queued
+  offline and pushed later by a charging-gated background daemon). Play the same game
+  across devices without thinking about it.
+- **On-device onboarding** — a built-in wizard (framebuffer UI) walks through server
+  pairing on first launch; later launches offer Sync-now / re-setup.
 
-The sync **engine** itself (`lodor-sync`) is **not** committed here — it's a build artifact of the
-[Lodor engine](https://github.com/lodordev/lodor). Build it for your device and drop it in the pak:
+## How it stays no-fork
+
+| Piece | muOS surface used |
+|---|---|
+| `Lodor Sync` app (wizard + engine) | `MUOS/application/` — a standard `.muxapp` |
+| Download-on-launch + save bracket | `info/override/<System>.sh` — muOS's own per-folder launch override; the stock `lr-general.sh` still runs the game |
+| Background save daemon | `MUOS/init/*.sh` — muOS's user-init boot hook |
+| Wi-Fi, RetroArch, box art | stock muOS — inherited, not re-implemented |
+
+The launch override only wraps RetroArch folders (decided from muOS's own
+`info/assign` config); standalone systems (PSP, etc.) are never touched. Launching a
+game is **never** gated on sync — if anything network-side fails, the game still runs.
+
+## Build
+
+The sync engine and wizard are CGO-free static Go binaries (muOS variant is the
+`muos` build tag):
 
 ```sh
-# RG34XX / H700 is ARM64
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o lodor-sync ./cmd/lodor-sync
+cd engine
+CGO_ENABLED=0 GOARCH=arm64 go build -tags muos -trimpath -ldflags "-s -w" ./cmd/lodor-sync
+CGO_ENABLED=0 GOARCH=arm64 go build -tags muos -trimpath -ldflags "-s -w" ./cmd/lodor-wizard
 ```
+
+The release pipeline (`release/release.sh`) builds both, gates them (static,
+branding, PII, redistributable), and assembles `Lodor-muOS-<version>.muxapp`.
 
 ## Install
 
-1. Build `lodor-sync` (above) and place it in `RomM Sync/`.
-2. Copy `config.json.example` to `config.json` and fill in your RomM host; pair on first run.
-3. Package `RomM Sync/` as a muOS `.muxapp` and copy it to your device's application directory.
-4. Launch it from muOS's Applications menu, onboard, and your library mirrors in.
+1. Copy `Lodor-muOS-<version>.muxapp` to `ARCHIVE/` on SD1 (`/mnt/mmc/ARCHIVE`).
+2. On the device: **Applications → Archive Manager** → install it.
+3. Launch **Lodor Sync** from Applications. The wizard walks you through pairing
+   with your RomM server (e.g. `https://romm.example.com`) and the initial mirror.
+   Wi-Fi setup stays in muOS Settings — connect first.
 
-## Status
+**Requires RomM 4.8.0 or newer** — device pairing (the on-device onboarding flow)
+ships in stock RomM as of 4.8.0.
 
-Built and **emulation-validated** against muOS on the Anbernic RG34XX. **On-hardware testing is still
-pending** — treat it as untested on real silicon until that's confirmed.
+Configuration lives in the app folder (`config.json`; see `config.json.example`).
+The app ships the public Mozilla CA bundle (`certs/ca-certificates.crt`) so HTTPS
+verification works on-device.
 
-## License
+## Layout
 
-MIT — see [LICENSE](LICENSE). Acknowledgements in [CREDITS.md](CREDITS.md). Ships no BIOS, firmware,
-muOS image, or game content.
+```
+App/Lodor Sync/
+  mux_launch.sh          # muOS app entry → onboarding wizard / sync menu
+  lodor-sync             # headless engine (built artifact, muos-arm64)
+  lodor-wizard           # framebuffer onboarding UI (built artifact, arm64)
+  lib/romm-sync-lib.sh   # shared shell library (env contract, Wi-Fi, corename lookup)
+  bin/lodor-override.sh  # launch override: stub-fetch → save-pull → stock launcher → save-push
+  bin/lodor-seed.sh      # (re)installs overrides + boot hook; idempotent
+  bin/romm-run           # app → engine bridge (network bring-up, logging)
+  bin/romm-syncd         # charging-gated offline save-push daemon
+  certs/                 # public Mozilla CA bundle
+  glyph/                 # app icon
+test/
+  check.sh               # shell-surface gate (parse + shellcheck)
+  integ-harness.sh       # end-to-end sandbox harness (real card image, qemu engine)
+```
+
+## Notes
+
+- BYOB: no BIOS or firmware is bundled, ever. Use the engine's `--download-bios`
+  against your own server's collection.
+- Saves are matched per libretro corename (read from the card's own core `.info`
+  files), exactly where stock RetroArch reads them.

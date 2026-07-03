@@ -1,7 +1,7 @@
 {
   "hosts": [
     {
-      "root_uri": "https://your-romm-host.example",
+      "root_uri": "https://romm.example.com",
       "port": 0,
       "token": "PASTE_A_ROMM_CLIENT_TOKEN_HERE",
       "device_name": "RG34XX"

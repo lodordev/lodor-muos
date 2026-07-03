@@ -2,7 +2,7 @@
 # HELP: Set up and sync your RomM library - wireless downloads + automatic save sync.
 # ICON: romm
 #
-# mux_launch.sh - the "RomM Sync" app entry under muOS Applications. It hands the screen
+# mux_launch.sh - the "Lodor Sync" app entry under muOS Applications. It hands the screen
 # to our pure-Go framebuffer wizard (lodor-wizard): first run shows the onboarding flow
 # (server, pairing, initial mirror); later runs show a Sync-now / re-setup menu. The
 # wizard drives the headless engine for all RomM work. Wi-Fi entry stays muOS's job.
@@ -29,9 +29,9 @@ done
 "$SELF_DIR/bin/lodor-seed.sh" >> "$LOG" 2>&1
 
 # Hand off to the wizard. It locates the engine next to itself and writes config.json into
-# LODOR_DATA_DIR. If the framebuffer/input can't be opened it exits non-zero and logs why
+# LODOR_PAK_DIR. If the framebuffer/input can't be opened it exits non-zero and logs why
 # (honest failure) - muOS restores the frontend on our exit either way.
-cd "$SELF_DIR"
+cd "$SELF_DIR" || exit 1
 LODOR_BIN="$SELF_DIR/lodor-sync" "$SELF_DIR/lodor-wizard" >> "$LOG" 2>&1
 rc=$?
 log "wizard exit rc=$rc"

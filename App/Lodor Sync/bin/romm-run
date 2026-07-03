@@ -1,5 +1,5 @@
 #!/bin/sh
-# romm-run <engine-args...> - bridge between the RomM Sync app and the headless engine.
+# romm-run <engine-args...> - bridge between the Lodor Sync app and the headless engine.
 # Brings Wi-Fi up (leaning on muOS's stock path), sets the clock (bounded), then runs the
 # CGO-free static engine with the env it needs. Unlike the MinUI build there is NO SDL/
 # lib32 baggage - the engine is a static arm64 binary. Logs every step.  MARKER: LODOR_RUN

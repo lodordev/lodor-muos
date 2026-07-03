@@ -45,12 +45,12 @@ lodor_info_dir() {
 # the active storage mount so it follows an SD1->SD2 storage migration without re-stamp.
 lodor_appdir() {
 	if [ -n "${LODOR_APPDIR:-}" ]; then echo "$LODOR_APPDIR"; return 0; fi
-	for d in "$MUOS_STORE_DIR/application/RomM Sync" \
-	         /mnt/mmc/MUOS/application/"RomM Sync" \
-	         /mnt/sdcard/MUOS/application/"RomM Sync"; do
+	for d in "$MUOS_STORE_DIR/application/Lodor Sync" \
+	         /mnt/mmc/MUOS/application/"Lodor Sync" \
+	         /mnt/sdcard/MUOS/application/"Lodor Sync"; do
 		[ -d "$d" ] && { echo "$d"; return 0; }
 	done
-	echo "$MUOS_STORE_DIR/application/RomM Sync"
+	echo "$MUOS_STORE_DIR/application/Lodor Sync"
 }
 
 APPDIR="$(lodor_appdir)"
@@ -79,10 +79,23 @@ log() { echo "$(date +'%F %T') $*" >> "$LOG" 2>/dev/null; }
 phase() { echo "$1" > "$PHASE" 2>/dev/null; }   # HONEST: only call with a confirmed-true line
 
 # Export the env the engine needs. ROMS_DIR/SAVES_DIR/BIOS_DIR default correctly inside
-# the muOS engine build, but we pin ROMS_DIR to the live rom mount and the data dir here.
+# the muOS engine build, but we pin ROMS_DIR to the live rom mount and the pak dir here.
 lodor_export_env() {
+	# LODOR_PAK_DIR is the canonical app-working-dir env (engine PakDir() + wizard);
+	# LODOR_DATA_DIR is kept ONLY as a back-compat alias for older scripts.
+	export LODOR_PAK_DIR="$DATA_DIR"
 	export LODOR_DATA_DIR="$DATA_DIR"
-	export ROMS_DIR="$(lodor_roms_dir)"
+	ROMS_DIR="$(lodor_roms_dir)"
+	export ROMS_DIR
+	# SDCARD_PATH: the engine's shared catalog code joins sdcardRoot()+"/Roms" under this
+	# root. Pin it to the live rom mount's parent (default /mnt/mmc); exFAT/vfat case-
+	# insensitivity makes ".../Roms" land in .../ROMS on-card. (Tracked ENGINE cleanup —
+	# do not "fix" the Roms/ROMS case here in shell.)
+	if [ -z "${SDCARD_PATH:-}" ]; then
+		SDCARD_PATH="$(dirname "$ROMS_DIR")"
+		[ -d "$SDCARD_PATH" ] || SDCARD_PATH="/mnt/mmc"
+	fi
+	export SDCARD_PATH
 	# SAVES_DIR / BIOS_DIR: let the muOS engine defaults stand (/run/muos/storage/...).
 	# TLS: the engine is a static Go binary; point Go's TLS at a CA bundle so HTTPS RomM
 	# servers verify. Prefer our bundled certs, fall back to the system store if present.
