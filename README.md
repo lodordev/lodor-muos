@@ -55,9 +55,6 @@ branding, PII, redistributable), and assembles `Lodor-muOS-<version>.muxapp`.
    with your RomM server (e.g. `https://romm.example.com`) and the initial mirror.
    Wi-Fi setup stays in muOS Settings — connect first.
 
-**Requires RomM 4.8.0 or newer** — device pairing (the on-device onboarding flow)
-ships in stock RomM as of 4.8.0.
-
 Configuration lives in the app folder (`config.json`; see `config.json.example`).
 The app ships the public Mozilla CA bundle (`certs/ca-certificates.crt`) so HTTPS
 verification works on-device.

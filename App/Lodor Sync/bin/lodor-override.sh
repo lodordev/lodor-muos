@@ -37,6 +37,29 @@ fi
 . "$LIB"
 lodor_export_env
 
+# --- engine invocation wrapper (CRITICAL CWD FIX, RG34XX field bug 2026-07-04) -----------
+# The engine loads config.json CWD-RELATIVE (engine config.Load -> os.ReadFile("config.json"),
+# NOT from LODOR_PAK_DIR). romm-run already cd's to $DATA_DIR before every engine call (its
+# line 27); this override never did, so every $BIN call here ran in muOS's launch CWD and the
+# engine aborted with `reading config.json: open config.json: no such file or directory` ->
+# fetch-on-launch failed -> the ROM stayed empty -> the launch was aborted. Root cause of
+# "games don't load". EVERY engine call in this override MUST go through engine() (or a
+# matching subshell cd) so config.json resolves. cd runs in a SUBSHELL so the load-bearing
+# launcher hand-off below keeps muOS's original CWD.
+engine() { ( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR failed (engine $1)"; "$BIN" "$@" ); }
+
+# splash <title> <body> [good|bad] - best-effort on-screen launch feedback drawn to /dev/fb0
+# by the wizard's pure-Go presenter (same renderer onboarding uses; no SDL, CGO-free). It
+# draws ONE frame and returns; the frame persists until RetroArch takes the screen. NEVER
+# gates the launch and NEVER fakes progress (feedback_no_fake_ui_state): if the wizard binary
+# or fb0 is unavailable it just logs and the text phase line still carries the honest status.
+splash() {
+	_wz="$APPDIR/lodor-wizard"
+	[ -x "$_wz" ] || { log "splash unavailable (no wizard bin) - phase-only: $1"; return 0; }
+	LODOR_BIN="$BIN" "$_wz" --splash "$1" "$2" "${3:-}" >> "$LOG" 2>&1 \
+		|| log "splash render failed (fb busy?) - phase-only: $1"
+}
+
 # Mark the in-game session so the daemon won't fight us for the radio mid-play.
 echo "$$" > "$INGAME_LOCK" 2>/dev/null
 trap 'rm -f "$INGAME_LOCK" 2>/dev/null' EXIT INT TERM HUP QUIT
@@ -55,9 +78,10 @@ log "save subdir=${LODOR_SAVE_SUBDIR:-<engine default>}"
 DL_OK=0
 if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	phase "Downloading $NAME..."
+	splash "Downloading" "$NAME" good   # visible on-screen feedback (user feedback #6)
 	if wifi_bring_up; then
 		DL_OUT="/tmp/lodor-dl.$$"
-		"$BIN" --download "$ROM" > "$DL_OUT" 2>&1; DL_RC=$?
+		engine --download "$ROM" > "$DL_OUT" 2>&1; DL_RC=$?
 		cat "$DL_OUT" >> "$LOG" 2>/dev/null
 		# HONEST success (mirrors NextUI's gm_download): engine rc=0 AND its own
 		# "downloaded=1" verdict (hash-verified - a mismatch deletes the bad file and
@@ -72,7 +96,15 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	fi
 	if [ ! -s "$ROM" ]; then
 		phase "Download failed - returning to menu"
+		# HONEST, LOUD failure (feedback_no_fake_ui_state): show a real error on-screen and
+		# hold it long enough to read before muOS redraws the menu - no silent abort.
+		if wifi_is_up; then
+			splash "Download failed" "Couldn't download $NAME. The server or transfer failed - check your RomM server, then launch again." bad
+		else
+			splash "No Wi-Fi" "Can't download $NAME while offline. Connect Wi-Fi in muOS Settings, then launch again." bad
+		fi
 		log "fetch-on-launch FAILED (rom still empty) - abort launch"
+		sleep 4
 		rm -f "$INGAME_LOCK" 2>/dev/null
 		exit 0
 	fi
@@ -83,10 +115,11 @@ fi
 # cold-bring-up delay to every launch). Pull only when the radio is ALREADY up - e.g. we
 # just downloaded the stub (radio warm) or the user enabled Wi-Fi. Hard-bounded. ----------
 if [ -n "$ROM" ] && wifi_is_up; then
+	# CWD FIX: cd in the subshell so config.json resolves; timeout wraps the engine inside it.
 	if command -v timeout >/dev/null 2>&1; then
-		timeout 25 "$BIN" --sync-save "$ROM" >> "$LOG" 2>&1
+		( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (pull)"; exec timeout 25 "$BIN" --sync-save "$ROM" ) >> "$LOG" 2>&1
 	else
-		"$BIN" --sync-save "$ROM" >> "$LOG" 2>&1
+		engine --sync-save "$ROM" >> "$LOG" 2>&1
 	fi
 fi
 
@@ -111,9 +144,30 @@ if [ -n "$ROM" ] && [ -e "$INGAME_LOCK" ]; then
 	# skipped and the save never reached RomM. Name-filter only now; the engine MD5-dedups
 	# (sync/push.go OutcomeAlreadyOnServer) so an UNCHANGED save is a verified no-op upload,
 	# not a redundant transfer. Mirrors the canonical minarch-shim clock fix.
-	if find "$SAVES" \( -iname "$_rbne.srm" -o -iname "$_rbne.sav" -o -iname "$_rbne.*" \) 2>/dev/null | grep -q .; then
+	# BRACKET-FIX (2026-07-03, #162): the old `-iname "$_rbne.*"` catch-all fed No-Intro
+	# glob metacharacters ([S] [!] [b] [h] [T-En]) to find's fnmatch, so a bracketed ROM's
+	# just-written save was never matched -> push/queue silently skipped -> save never
+	# reached RomM. Now enumerate the KNOWN save extensions and escape the two glob metachars
+	# `[`/`]` in the stem/basename so find matches the literal name. Both save-naming styles
+	# are covered (RetroArch "<stem>.srm", minarch "<full>.sav", states "<name>.state*").
+	# Escape the two glob metachars for find's fnmatch. Order-safe: `]`->placeholder first so
+	# the `[`->`[[]` pass can't re-mangle a just-emitted bracket, then placeholder->`[]]`.
+	_rb_g=$(printf %s "$_rb" | sed -e 's/\]/@LODORRB@/g' -e 's/\[/[[]/g' -e 's/@LODORRB@/[]]/g')
+	_rbne_g=$(printf %s "$_rbne" | sed -e 's/\]/@LODORRB@/g' -e 's/\[/[[]/g' -e 's/@LODORRB@/[]]/g')
+	if find "$SAVES" \( \
+		-iname "$_rbne_g.srm" -o -iname "$_rbne_g.sav" -o -iname "$_rbne_g.dsv" \
+		-o -iname "$_rbne_g.mcr" -o -iname "$_rbne_g.mcd" -o -iname "$_rbne_g.brm" \
+		-o -iname "$_rbne_g.eep" -o -iname "$_rbne_g.sra" -o -iname "$_rbne_g.fla" \
+		-o -iname "$_rbne_g.mpk" -o -iname "$_rbne_g.nv" -o -iname "$_rbne_g.rtc" \
+		-o -iname "$_rbne_g.state*" \
+		-o -iname "$_rb_g.srm" -o -iname "$_rb_g.sav" -o -iname "$_rb_g.dsv" \
+		-o -iname "$_rb_g.mcr" -o -iname "$_rb_g.mcd" -o -iname "$_rb_g.brm" \
+		-o -iname "$_rb_g.eep" -o -iname "$_rb_g.sra" -o -iname "$_rb_g.fla" \
+		-o -iname "$_rb_g.mpk" -o -iname "$_rb_g.nv" -o -iname "$_rb_g.rtc" \
+		-o -iname "$_rb_g.state*" \
+	\) 2>/dev/null | grep -q .; then
 		if wifi_is_up; then
-			"$BIN" --sync-save "$ROM" >> "$LOG" 2>&1 || { grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"; }
+			engine --sync-save "$ROM" >> "$LOG" 2>&1 || { grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"; }
 		else
 			grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"
 			log "save changed, offline -> queued pending"
@@ -130,7 +184,7 @@ fi
 # and carries the save + cover with the rename. Best-effort: on failure the marker just
 # stays until the next refresh; the game already ran and the save is already handled.
 if [ "$DL_OK" = 1 ] && [ -s "$ROM" ]; then
-	"$BIN" --reconcile "$ROM" >> "$LOG" 2>&1 || log "reconcile failed - marker stays until next refresh"
+	engine --reconcile "$ROM" >> "$LOG" 2>&1 || log "reconcile failed - marker stays until next refresh"
 fi
 
 rm -f "$INGAME_LOCK" 2>/dev/null

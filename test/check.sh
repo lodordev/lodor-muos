@@ -18,11 +18,15 @@ fails=0
 POSIX_FILES=(
 	"$APP/mux_launch.sh"
 	"$APP/lib/romm-sync-lib.sh"
+	"$APP/lib/tailscale-lib.sh"
 	"$APP/bin/lodor-override.sh"
 	"$APP/bin/lodor-seed.sh"
+	"$APP/bin/lodor-ts.sh"
+	"$APP/bin/lodor-collect.sh"
 	"$APP/bin/romm-run"
 	"$APP/bin/romm-syncd"
 	"$HERE/integ-harness.sh"
+	"$HERE/wizard-loop.sh"
 )
 BASH_FILES=(
 	"$HERE/check.sh"
@@ -58,7 +62,10 @@ echo "== static: shellcheck =="
 #                  normalization (same rationale as the nextui gate)
 #   SC2034         cross-file vars set by the lib for its sourcing scripts (BIN/PENDING) plus the
 #                  documented engine-side path contract (PROGRESS) — contract, not dead code
-SC_EXCLUDES="SC1007,SC1090,SC1091,SC2018,SC2019,SC2034"
+#   SC2209/SC2015  tailscale-lib.sh (ported verbatim from the field-tested nextui lib): `TS_BG=nohup`
+#                  assigns a command NAME on purpose (SC2209), and its `A && B || C` status idioms
+#                  are intentional (SC2015). Same excludes the nextui gate pins for the same file.
+SC_EXCLUDES="SC1007,SC1090,SC1091,SC2015,SC2018,SC2019,SC2034,SC2209"
 run_shellcheck() {
 	if command -v shellcheck >/dev/null 2>&1; then
 		shellcheck -x -e "$SC_EXCLUDES" "$@"

@@ -45,6 +45,17 @@ docker run --rm -v "$REPO":/w -w /w/engine -e CGO_ENABLED=0 -e GOARCH=arm64 \
 	golang:1.25-bookworm go build -tags muos -trimpath -ldflags "-s -w" \
 	-o /w/engine/.integ-out-wizard ./cmd/lodor-wizard || { echo "FATAL: wizard build failed"; exit 1; }
 
+echo "=== menu-row assertions: unit-test the PURE management-menu spine + ScrollMenu ==="
+# The management menu lives in the Go wizard (muOS can't hook the stock launcher). Its row
+# table (buildMenuRows) + the ScrollMenu window are pure, so we assert them off-hardware:
+# each row maps to the right engine mode, conditional rows (pending/queue/pairing/Tailscale)
+# gate correctly, and ScrollMenu keeps the selection in its window. A failure here is a hard
+# stop (loud, never a silent pass) BEFORE the sandbox section.
+docker run --rm -v "$REPO":/w -w /w/engine -e CGO_ENABLED=0 \
+	golang:1.25-bookworm go test ./cmd/lodor-wizard/ ./ui/ 2>&1 | tail -6 \
+	|| { echo "FATAL: menu-spine unit tests failed (row->mode / ScrollMenu)"; exit 1; }
+echo "ok: menu-row assertions pass (row->mode mapping, conditional rows, ScrollMenu window)"
+
 echo "=== reset sandbox: $SB ==="
 rm -rf "$SB"
 mkdir -p "$SB/opt-muos/script/var" "$SB/opt-muos/script/launch" \
@@ -147,7 +158,11 @@ echo "===== TEST 2: launch a REAL rom via the override (dispatch + save -> pendi
 # Wifi fake OFF for the offline tests: point wifi_is_up at a downed state.
 echo down > "$SB/sysnet/wlan0/operstate"
 ROM="$SB/mmc/Roms/Sega Game Gear/5 in 1 FunPak (USA).gg"
-"$OV" "5 in 1 FunPak" "genesis_plus_gx_libretro.so" "$ROM"; rc=$?
+# DEVICE-FAITHFUL CWD: muOS's launch.sh execs the override from its OWN cwd, NOT the app
+# dir. Run every override invocation from "/" so the harness reproduces the field CWD the
+# 2026-07-04 config.json bug lived in (the old `cd "$APP"` below MASKED it). The fixed
+# override cd's to $DATA_DIR internally for each engine call.
+( cd / && "$OV" "5 in 1 FunPak" "genesis_plus_gx_libretro.so" "$ROM" ); rc=$?
 [ "$rc" = 0 ] && echo "ok: override rc=0" || { echo "FAIL: override rc=$rc"; fails=$((fails+1)); }
 SAVE="/run/muos/storage/save/file/Genesis Plus GX/5 in 1 FunPak (USA).srm"
 [ -s "$SAVE" ] && echo "ok: stub RetroArch wrote the save" || { echo "FAIL: no save written"; fails=$((fails+1)); }
@@ -158,7 +173,7 @@ echo
 echo "===== TEST 3: fetch-on-launch on a 0-byte STUB with no network (honest abort) ====="
 STUBROM="$SB/mmc/Roms/Sega Game Gear/Aladdin (USA, Europe, Brazil) (En).gg"
 : > "$STUBROM"
-"$OV" "Aladdin" "genesis_plus_gx_libretro.so" "$STUBROM"; rc=$?
+( cd / && "$OV" "Aladdin" "genesis_plus_gx_libretro.so" "$STUBROM" ); rc=$?
 [ "$rc" = 0 ] || { echo "FAIL: stub abort rc=$rc (must return to menu cleanly)"; fails=$((fails+1)); }
 [ -s "$STUBROM" ] && { echo "FAIL: stub grew with no network?!"; fails=$((fails+1)); } || echo "ok: stub still 0 bytes (not launched empty)"
 echo "phase line: $(cat /tmp/romm-phase 2>/dev/null)"
@@ -174,9 +189,34 @@ if [ "$n" -gt 0 ]; then
 		[ "$(head -c4 "$p" | od -An -tx1 | tr -d ' \n')" = "89504e47" ] || badpng=$((badpng+1))
 	done
 	[ "$badpng" = 0 ] && echo "ok: wizard rendered $n PNG screens" || { echo "FAIL: $badpng non-PNG captures"; fails=$((fails+1)); }
+	# MENU-ROW RENDER assertions: the new management menu (ScrollMenu-backed) and a Game
+	# Manager per-game screen must render as valid PNGs on the actual built wizard binary —
+	# proving ScrollMenu draws and the parity menu paints (not just the pure row table).
+	for want in 10-menu.png 13-gamemanager.png; do
+		p="$SB/capture/$want"
+		if [ -f "$p" ] && [ "$(head -c4 "$p" | od -An -tx1 | tr -d ' \n')" = "89504e47" ]; then
+			echo "ok: management menu screen rendered ($want)"
+		else
+			echo "FAIL: menu screen $want missing/not-a-PNG (ScrollMenu render)"; fails=$((fails+1))
+		fi
+	done
 else
 	echo "FAIL: wizard --capture produced no PNGs"; fails=$((fails+1))
 fi
+
+echo
+echo "===== TEST 4b: wizard emits its startup PHASE lines (BUG 2a instrumentation) ====="
+# The interactive startup path (fb + evdev) can't run off-hardware, so --phase-selftest replays
+# the SAME phase strings the real startup emits via the SAME logPhase, to stderr. A missing line
+# here means the next on-hardware hang would NOT be localizable — a hard fail, never a silent pass.
+PLOG="$SB/capture/wizard-phase.log"
+"$APP/lodor-wizard" --phase-selftest 2> "$PLOG" >/dev/null || true
+pmiss=0
+for ph in "wizard: start" "fb open " "input open " "configured=" \
+          "menu: build state" "menu: state ok (" "menu: first draw" "menu: awaiting input"; do
+	grep -qF "$ph" "$PLOG" 2>/dev/null || { echo "FAIL: startup phase line missing: '$ph'"; pmiss=$((pmiss+1)); }
+done
+[ "$pmiss" = 0 ] && echo "ok: all 8 startup phase lines emitted (hang next time is localizable)" || fails=$((fails+pmiss))
 
 if [ "$LIVE" = 1 ]; then
 	echo
@@ -217,7 +257,17 @@ if [ "$LIVE" = 1 ]; then
 		# name (save + cover carried by the engine). Compute the expected post-launch path.
 		DLDIR=$(dirname "$DL"); DLB=$(basename "$DL")
 		case "$DLB" in "✘ "*) VDL="$DLDIR/✓ ${DLB#✘ }" ;; *) VDL="$DL" ;; esac
-		"$OV" "$(basename "${DL%.*}")" "genesis_plus_gx_libretro.so" "$DL"; rc=$?
+		# Run the override from "/" (device CWD) — the exact condition that broke on the
+		# RG34XX. Snapshot the log first so we can assert the config.json error never recurs.
+		: > "$APP/romm.log"
+		( cd / && "$OV" "$(basename "${DL%.*}")" "genesis_plus_gx_libretro.so" "$DL" ); rc=$?
+		# THE FIELD-BUG ASSERTION: the fetch-on-launch engine call must resolve config.json
+		# from the device CWD. Its absence in the log proves the 2026-07-04 abort is gone.
+		if grep -q "open config.json: no such file" "$APP/romm.log"; then
+			echo "FAIL: config.json CWD bug STILL present in override log (fetch-on-launch aborted)"; fails=$((fails+1))
+		else
+			echo "ok: no 'open config.json: no such file' in override log — field CWD bug fixed"
+		fi
 		[ -s "$VDL" ] && echo "ok: rom downloaded ($(stat -c %s "$VDL") bytes, engine-hash-verified)" \
 			|| { echo "FAIL: rom missing/empty at reconciled path (rc=$rc): $VDL"; fails=$((fails+1)); }
 		if [ "$VDL" != "$DL" ]; then

@@ -17,47 +17,52 @@ mkdir -p "$OVERRIDE_ROOT" 2>/dev/null
 # norm: lowercase, strip everything but a-z0-9 (muOS folder<->friendly matching is fuzzy).
 norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9'; }
 
-# find_system_dir <folder> : echo the assign system dir whose catalogue/name/friendly alias
-# matches <folder>. Empty if none (then we can't tell launcher type -> skip, honestly).
-find_system_dir() {
-	_want="$(norm "$1")"
+# PERF (BUG 1b): the old path called find_system_dir PER ROM FOLDER, each time rescanning
+# EVERY assign global.ini with a fistful of sed/subshell spawns - O(folders x systems) on
+# busybox, a big chunk of "takes forever to load". Rework: build the assign -> launcher-type
+# map in ONE pass (O(systems)), then match each folder against it (O(folders)). Total O(n).
+#
+# build_assign_map: for every assign system, decide RetroArch (RA) vs standalone (SA) ONCE
+# from its DEFAULT launcher's exec (lr-* => RA), then emit "<normkey> <type>" for each name it
+# can be matched by (catalogue / name / dir-basename / [friendly] aliases). One map file.
+ASSIGN_MAP="${TMPDIR:-/tmp}/lodor-assign-map.$$"
+: > "$ASSIGN_MAP" 2>/dev/null
+build_assign_map() {
 	for gi in "$ASSIGN_ROOT"/*/global.ini; do
 		[ -f "$gi" ] || continue
 		_d=$(dirname "$gi")
-		_cat=$(sed -n 's/^catalogue=//p' "$gi" | head -1)
-		_nam=$(sed -n 's/^name=//p' "$gi" | head -1)
-		if [ "$(norm "${_cat:-}")" = "$_want" ] || [ "$(norm "${_nam:-}")" = "$_want" ] || [ "$(norm "$(basename "$_d")")" = "$_want" ]; then
-			echo "$_d"; return 0
+		_def=$(sed -n 's/^default=//p' "$gi" | head -1)
+		_type=SA
+		if [ -n "$_def" ] && [ -f "$_d/$_def.ini" ]; then
+			_exec=$(sed -n 's#^exec=##p' "$_d/$_def.ini" | head -1)
+			case "$(basename "${_exec:-}")" in lr-*) _type=RA ;; esac
 		fi
-		# friendly aliases (one per line under [friendly])
-		if sed -n '/^\[friendly\]/,/^\[/p' "$gi" | sed '1d;/^\[/d' | while read -r fa; do
-			[ -n "$fa" ] && [ "$(norm "$fa")" = "$_want" ] && exit 0; done; then
-			echo "$_d"; return 0
-		fi
+		# all match keys for this system: catalogue, name, dir basename, friendly aliases.
+		{
+			sed -n 's/^catalogue=//p;s/^name=//p' "$gi"
+			basename "$_d"
+			sed -n '/^\[friendly\]/,/^\[/p' "$gi" | sed '1d;/^\[/d'
+		} | while IFS= read -r _k; do
+			_nk=$(norm "$_k")
+			[ -n "$_nk" ] && printf '%s %s\n' "$_nk" "$_type"
+		done >> "$ASSIGN_MAP"
 	done
-	return 1
 }
 
-# is_retroarch_folder <folder> : true if the folder's DEFAULT launcher exec is an lr-*.sh
-# (RetroArch). Standalone (ext-*.sh) -> false. Unknown -> false (skip, never mis-route).
-is_retroarch_folder() {
-	_sys="$(find_system_dir "$1")" || return 1
-	_def=$(sed -n 's/^default=//p' "$_sys/global.ini" | head -1)
-	[ -n "$_def" ] || return 1
-	_ini="$_sys/$_def.ini"
-	[ -f "$_ini" ] || return 1
-	_exec=$(sed -n 's#^exec=##p' "$_ini" | head -1)
-	case "$(basename "${_exec:-}")" in
-		lr-*) return 0 ;;
-		*) return 1 ;;
-	esac
+# folder_type <folder> : RA | SA | "" (unknown) from the in-memory map (one awk lookup).
+folder_type() {
+	_nk=$(norm "$1")
+	[ -n "$_nk" ] || return 0
+	awk -v k="$_nk" '$1==k {print $2; exit}' "$ASSIGN_MAP" 2>/dev/null
 }
+
+build_assign_map
 
 seeded=0; skipped=0
 [ -d "$ROMS" ] && for d in "$ROMS"/*/; do
 	[ -d "$d" ] || continue
 	f=$(basename "$d")
-	if is_retroarch_folder "$f"; then
+	if [ "$(folder_type "$f")" = "RA" ]; then
 		ln -sf "$TARGET" "$OVERRIDE_ROOT/$f.sh" 2>/dev/null && seeded=$((seeded+1))
 	else
 		# Standalone or unknown launcher: do NOT override (would break its ext-*.sh launch).
@@ -66,6 +71,7 @@ seeded=0; skipped=0
 		skipped=$((skipped+1))
 	fi
 done
+rm -f "$ASSIGN_MAP" 2>/dev/null
 
 # Daemon autostart: ensure the single boot hook exists in MUOS/init/ (user_init runs every
 # *.sh there backgrounded at boot). Written only if ABSENT so we never duplicate the shipped
