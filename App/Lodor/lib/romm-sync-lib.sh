@@ -45,12 +45,12 @@ lodor_info_dir() {
 # the active storage mount so it follows an SD1->SD2 storage migration without re-stamp.
 lodor_appdir() {
 	if [ -n "${LODOR_APPDIR:-}" ]; then echo "$LODOR_APPDIR"; return 0; fi
-	for d in "$MUOS_STORE_DIR/application/Lodor Sync" \
-	         /mnt/mmc/MUOS/application/"Lodor Sync" \
-	         /mnt/sdcard/MUOS/application/"Lodor Sync"; do
+	for d in "$MUOS_STORE_DIR/application/Lodor" \
+	         /mnt/mmc/MUOS/application/Lodor \
+	         /mnt/sdcard/MUOS/application/Lodor; do
 		[ -d "$d" ] && { echo "$d"; return 0; }
 	done
-	echo "$MUOS_STORE_DIR/application/Lodor Sync"
+	echo "$MUOS_STORE_DIR/application/Lodor"
 }
 
 APPDIR="$(lodor_appdir)"

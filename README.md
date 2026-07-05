@@ -1,4 +1,4 @@
-# Lodor Sync for muOS
+# Lodor for muOS
 
 A **no-fork** [RomM](https://github.com/rommapp/romm) client for stock
 [muOS](https://muos.dev) (MustardOS). Wireless library mirroring, download-on-launch,
@@ -24,7 +24,7 @@ Validated target: Anbernic RG34XX (Allwinner H700, arm64) on muOS 2601 "Jacarand
 
 | Piece | muOS surface used |
 |---|---|
-| `Lodor Sync` app (wizard + engine) | `MUOS/application/` — a standard `.muxapp` |
+| `Lodor` app (wizard + engine) | `MUOS/application/` — a standard `.muxapp` |
 | Download-on-launch + save bracket | `info/override/<System>.sh` — muOS's own per-folder launch override; the stock `lr-general.sh` still runs the game |
 | Background save daemon | `MUOS/init/*.sh` — muOS's user-init boot hook |
 | Wi-Fi, RetroArch, box art | stock muOS — inherited, not re-implemented |
@@ -51,7 +51,7 @@ branding, PII, redistributable), and assembles `Lodor-muOS-<version>.muxapp`.
 
 1. Copy `Lodor-muOS-<version>.muxapp` to `ARCHIVE/` on SD1 (`/mnt/mmc/ARCHIVE`).
 2. On the device: **Applications → Archive Manager** → install it.
-3. Launch **Lodor Sync** from Applications. The wizard walks you through pairing
+3. Launch **Lodor** from Applications. The wizard walks you through pairing
    with your RomM server (e.g. `https://romm.example.com`) and the initial mirror.
    Wi-Fi setup stays in muOS Settings — connect first.
 
@@ -62,7 +62,7 @@ verification works on-device.
 ## Layout
 
 ```
-App/Lodor Sync/
+App/Lodor/
   mux_launch.sh          # muOS app entry → onboarding wizard / sync menu
   lodor-sync             # headless engine (built artifact, muos-arm64)
   lodor-wizard           # framebuffer onboarding UI (built artifact, arm64)

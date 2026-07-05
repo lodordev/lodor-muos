@@ -1,5 +1,5 @@
 #!/bin/bash
-# check.sh — the one-command gate for the muOS "Lodor Sync" app shell surface:
+# check.sh — the one-command gate for the muOS "Lodor" app shell surface:
 #   STATIC: bash -n + POSIX-sh parse of every app/test script, then shellcheck
 #           (local binary, else the koalaman/shellcheck docker image, else skipped
 #           with a warning — parse checks still gate).
@@ -9,7 +9,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MUOS="$(cd "$HERE/.." && pwd)"
-APP="$MUOS/App/Lodor Sync"
+APP="$MUOS/App/Lodor"
 fails=0
 
 # ---- the shell surface under gate ----

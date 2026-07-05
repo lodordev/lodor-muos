@@ -7,8 +7,9 @@
 # off-device. This harness runs THAT path off-hardware via two test seams that leave the
 # production code byte-identical:
 #   LODOR_FB_DEV    -> a file-backed framebuffer (synthesized fb_var/fb_fix_screeninfo, the
-#                      real pack/Flush/mmap blit; geometry from LODOR_FB_GEOM, default a real
-#                      RG34XX 640x480x32 panel). /dev/fb0 unset => production unchanged.
+#                      real pack/Flush/mmap blit; geometry from LODOR_FB_GEOM, default the real
+#                      RG34XX 720x480x32 panel; LODOR_FB_YVIRT/LODOR_FB_YOFF model the H700
+#                      double-buffer page flip). /dev/fb0 unset => production unchanged.
 #   LODOR_INPUT_SCRIPT -> a ScriptedSource feeding logical buttons into the REAL runMainMenu.
 #   LODOR_FB_DUMP   -> dump the actually-blitted frame to PNG (read back through the device
 #                      pixel format) so we can verify the render pipeline end to end.
@@ -23,14 +24,14 @@
 #                     degrade Tailscale to unavailable, paint, and exit — all well under TMO.
 #
 # Env knobs: WIZARD_LOOP_SB (sandbox, wiped), WIZARD_LOOP_TIMEOUT (per-run, default 30s),
-#            LODOR_FB_GEOM (default 640x480x32).
+#            LODOR_FB_GEOM (default 720x480x32).
 set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MUOS_ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 REPO=$(CDPATH= cd -- "$MUOS_ROOT/../.." && pwd)
 SB="${WIZARD_LOOP_SB:-/tmp/lodor-wizard-loop}"
 TMO="${WIZARD_LOOP_TIMEOUT:-30}"
-GEOM="${LODOR_FB_GEOM:-640x480x32}"
+GEOM="${LODOR_FB_GEOM:-720x480x32}"
 fails=0
 
 command -v timeout >/dev/null 2>&1 || { echo "FATAL: coreutils 'timeout' required"; exit 1; }

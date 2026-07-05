@@ -2,7 +2,7 @@
 # integ-harness.sh — Lodor-muOS end-to-end integration harness (monorepo edition).
 #
 # Builds a bind-mount sandbox mimicking /opt/muos and /run/muos/storage from the REAL
-# muOS card image, installs the "Lodor Sync" app (source from ../App, engine + wizard
+# muOS card image, installs the "Lodor" app (source from ../App, engine + wizard
 # built fresh from THIS repo's engine/ via docker), and exercises the full surface:
 #   offline: lodor-seed.sh, launch override dispatch, save->pending queue, stub honest-abort
 #   live:    engine --validate, --mirror-catalog stub counts, download-on-launch
@@ -24,7 +24,7 @@ REPO=$(CDPATH= cd -- "$MUOS_ROOT/../.." && pwd)       # monorepo root
 IMG="${MUOS_IMAGE:-/mnt/cache/tmp/lodor-muos/MustardOS_RG34XX-H_2601.1_FUNKY_JACARANDA-bc38efa0.img}"
 CFG_SRC="${LODOR_CFG:-/mnt/cache/tmp/lodor-muos/sandbox/pak/config.json}"
 SB="${LODOR_SB:-/tmp/lodor-muos-integ}"
-PAK_SRC="$MUOS_ROOT/App/Lodor Sync"
+PAK_SRC="$MUOS_ROOT/App/Lodor"
 
 if [ ! -f "$IMG" ]; then
 	echo "##############################################################################"
@@ -105,9 +105,9 @@ echo "    inet 192.0.2.10/24 scope global wlan0"
 FAKEIP
 chmod +x "$SB/fakebin/ip"
 
-echo "=== install the Lodor Sync app into the sandbox application dir ==="
-cp -r "$PAK_SRC" "$SB/storage/application/Lodor Sync"
-APP_SB="$SB/storage/application/Lodor Sync"
+echo "=== install the Lodor app into the sandbox application dir ==="
+cp -r "$PAK_SRC" "$SB/storage/application/Lodor"
+APP_SB="$SB/storage/application/Lodor"
 cp "$SB/lodor-sync" "$APP_SB/lodor-sync"; chmod +x "$APP_SB/lodor-sync"
 cp "$SB/lodor-wizard" "$APP_SB/lodor-wizard"; chmod +x "$APP_SB/lodor-wizard"
 LIVE=0
@@ -137,7 +137,7 @@ mount --bind "$SB/opt-muos" /opt/muos
 mount --bind "$SB/storage" /run/muos/storage
 mount --bind "$SB/sysnet" /sys/class/net 2>/dev/null || echo "WARN: /sys/class/net bind failed — live wifi-path tests may skip"
 PATH="$SB/fakebin:$PATH"; export PATH
-APP="/run/muos/storage/application/Lodor Sync"
+APP="/run/muos/storage/application/Lodor"
 export LODOR_APPDIR="$APP"
 export ROMS_DIR="$SB/mmc/Roms"
 export SDCARD_PATH="$SB/mmc"

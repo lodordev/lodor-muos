@@ -2,7 +2,7 @@
 # HELP: Set up and sync your RomM library - wireless downloads + automatic save sync.
 # ICON: romm
 #
-# mux_launch.sh - the "Lodor Sync" app entry under muOS Applications. It hands the screen
+# mux_launch.sh - the "Lodor" app entry under muOS Applications. It hands the screen
 # to our pure-Go framebuffer wizard (lodor-wizard): first run shows the onboarding flow
 # (server, pairing, initial mirror); later runs show a Sync-now / re-setup menu. The
 # wizard drives the headless engine for all RomM work. Wi-Fi entry stays muOS's job.

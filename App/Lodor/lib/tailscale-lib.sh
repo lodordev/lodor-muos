@@ -162,6 +162,27 @@ _ts_hostname() {
 	printf '%s' "$dn" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed 's/^-*//; s/-*$//'
 }
 
+# _ts_wantrunning_up — drive a persisted-login node from Stopped -> Running. Restoring the
+# tailscaled state can ALSO restore WantRunning=false (the node was "Tailscale: stopped" when
+# its state was last saved) — the daemon then loads the login but never connects, the backend
+# sits at "Stopped", MagicDNS never resolves the RomM host, and the engine's SOCKS5 dial fails
+# with "no such host" (the 2026-07-04 field DLFAIL). `tailscale up` REUSES the persisted login
+# (NO re-auth, NO key, NO --reset) and only flips WantRunning=true. Backgrounded via $TS_BG so
+# a wedged/blocked up never stalls the caller's Running poll; a valid persisted login connects
+# in a second or two. Idempotent: a no-op when the backend is already Running.
+_ts_wantrunning_up() {
+	if "$TS_BIN_DIR/tailscale" --socket="$TS_SOCK" status --json 2>/dev/null \
+		| grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+		return 0
+	fi
+	ts_log "backend not Running (persisted state may carry WantRunning=false) — 'tailscale up' to reuse login + set WantRunning=true"
+	$TS_BG "$TS_BIN_DIR/tailscale" --socket="$TS_SOCK" up \
+		--hostname="$(_ts_hostname)" \
+		--accept-dns=false \
+		--accept-routes=false >> "$TS_LOG" 2>&1 &
+	return 0
+}
+
 # tailscale_up — start userspace tailscaled + REUSE a persisted login (QR-onboarded state).
 # No authkey required for the QR path. Returns 0 only when Running (SOCKS5 listening); any
 # skip/failure returns non-0. NEVER logs the authkey.
@@ -195,16 +216,31 @@ tailscale_up() {
 	# Reuse persisted login (QR onboarding) — poll to Running (a returning node re-auths a
 	# few seconds after the socket appears; a single-shot check races it to a false NeedsLogin).
 	if [ -s "$TS_STATEDIR/tailscaled.state" ]; then
+		# CRITICAL (2026-07-04 field DLFAIL): restoring the persisted state can leave the
+		# backend Stopped (WantRunning=false) — the daemon has the login but never connects,
+		# so MagicDNS never resolves and every download/sync dial fails. Kick WantRunning=true
+		# (reuses the login, no key) BEFORE the poll, else this loop times out forever waiting
+		# for a Running the daemon was never told to reach.
+		_ts_wantrunning_up
 		i=0
-		while [ "$i" -lt 150 ]; do
-			if "$TS_BIN_DIR/tailscale" --socket="$TS_SOCK" status --json 2>/dev/null | grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+		while [ "$i" -lt 250 ]; do
+			_bs=$("$TS_BIN_DIR/tailscale" --socket="$TS_SOCK" status --json 2>/dev/null \
+				| grep -oE '"BackendState"[[:space:]]*:[[:space:]]*"[A-Za-z]+"' | head -1 \
+				| grep -oE '"[A-Za-z]+"' | tail -1 | tr -d '"')
+			if [ "$_bs" = "Running" ]; then
 				ts_log "tier-1 up: reusing persisted login (no key)"
 				_ts_state_save
 				return 0
 			fi
+			# Settled back to Stopped (WantRunning still false — the up call raced the daemon's
+			# state load, or the daemon flipped it): re-kick, bounded to a few tries so a
+			# genuinely unreachable node still fails honestly instead of looping.
+			if [ "$_bs" = "Stopped" ] && [ $((i % 50)) = 0 ] && [ "$i" -gt 0 ]; then
+				_ts_wantrunning_up
+			fi
 			sleep 0.1; i=$((i + 1))
 		done
-		ts_log "persisted state present but not Running after 15s (daemon left up)"
+		ts_log "persisted state present but not Running after 25s (daemon left up)"
 		return 1
 	fi
 	# Not authenticated and no persisted state. Headless authkey path (parity; no key ships).

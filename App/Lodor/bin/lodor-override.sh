@@ -20,8 +20,8 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || ech
 # The symlink lives in muOS's override dir; the real script + lib live in the app dir.
 LIB=""
 for c in "$SELF_DIR/../lib/romm-sync-lib.sh" \
-         "/run/muos/storage/application/Lodor Sync/lib/romm-sync-lib.sh" \
-         "/mnt/mmc/MUOS/application/Lodor Sync/lib/romm-sync-lib.sh"; do
+         "/run/muos/storage/application/Lodor/lib/romm-sync-lib.sh" \
+         "/mnt/mmc/MUOS/application/Lodor/lib/romm-sync-lib.sh"; do
 	[ -f "$c" ] && { LIB="$c"; break; }
 done
 
@@ -36,6 +36,41 @@ if [ -z "$LIB" ]; then
 fi
 . "$LIB"
 lodor_export_env
+
+# Tailscale (tier-1) bring-up lib lives next to romm-sync-lib.sh. Sourced for the LAUNCH path
+# only — the menu keeps its lazy/background bring-up (mux_launch.sh). A tier-2 (direct) host
+# never touches this; if the lib is absent the tier-1 helpers below no-op to "not tier-1".
+TS_LIB="$(dirname -- "$LIB")/tailscale-lib.sh"
+[ -f "$TS_LIB" ] && . "$TS_LIB" 2>/dev/null
+
+# ensure_tunnel_up — the LAUNCH path's SYNCHRONOUS tier-1 gate. For a Tailscale/SOCKS5 host the
+# engine dials RomM THROUGH the userspace tunnel, so the tunnel MUST be Running before any
+# --download / --sync-save, or MagicDNS never resolves and the dial fails (the field DLFAIL).
+# The menu bring-up is lazy and may not have reached Running yet — the launch path cannot rely
+# on it, so it drives TS up here and waits (tailscale_up returns 0 only at BackendState=Running,
+# bounded to ~25s internally). Prints an honest "Connecting…" splash while it waits.
+#   0 = Running, OR not a tier-1 host (nothing to do)
+#   1 = tier-1 host that could NOT reach Running within the bound (honest failure)
+ensure_tunnel_up() {
+	command -v tailscale_is_tier1 >/dev/null 2>&1 || return 0   # lib absent -> treat as tier-2
+	tailscale_is_tier1 || return 0                              # tier-2 (direct) host -> no tunnel
+	[ "$(tailscale_status 2>/dev/null)" = "connected" ] && return 0   # already Running
+	phase "Connecting to your server..."
+	splash "Connecting" "Reaching your server over Tailscale..." good
+	tailscale_up >> "$LOG" 2>&1
+	[ "$(tailscale_status 2>/dev/null)" = "connected" ]
+}
+
+# server_reachable — cheap gate for the OPPORTUNISTIC save pull/push calls (never brings
+# anything up). A tier-2 host is reachable whenever Wi-Fi is up; a tier-1 host ALSO needs the
+# tunnel Running, else the engine's SOCKS5 dial just burns its whole 25s timeout on every
+# launch. Keeps the save bracket honest without adding a cold bring-up to the launch.
+server_reachable() {
+	wifi_is_up || return 1
+	command -v tailscale_is_tier1 >/dev/null 2>&1 || return 0
+	tailscale_is_tier1 || return 0
+	[ "$(tailscale_status 2>/dev/null)" = "connected" ]
+}
 
 # --- engine invocation wrapper (CRITICAL CWD FIX, RG34XX field bug 2026-07-04) -----------
 # The engine loads config.json CWD-RELATIVE (engine config.Load -> os.ReadFile("config.json"),
@@ -79,7 +114,22 @@ DL_OK=0
 if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	phase "Downloading $NAME..."
 	splash "Downloading" "$NAME" good   # visible on-screen feedback (user feedback #6)
+	NET_OK=0; TS_FAIL=0
 	if wifi_bring_up; then
+		# tier-1 (Tailscale) host: the tunnel MUST be Running before --download (the engine
+		# dials RomM through the SOCKS5 proxy; MagicDNS resolves only once Running). SYNCHRONOUS
+		# + bounded here — the menu's lazy bring-up can NOT be relied on for the launch path.
+		# A tier-2 (direct) host makes this a no-op (returns 0), so nothing changes there.
+		if ensure_tunnel_up; then
+			NET_OK=1
+		else
+			TS_FAIL=1
+			log "fetch-on-launch: Tailscale tunnel not Running - cannot reach tier-1 server"
+		fi
+	else
+		log "fetch-on-launch: no network"
+	fi
+	if [ "$NET_OK" = 1 ]; then
 		DL_OUT="/tmp/lodor-dl.$$"
 		engine --download "$ROM" > "$DL_OUT" 2>&1; DL_RC=$?
 		cat "$DL_OUT" >> "$LOG" 2>/dev/null
@@ -89,16 +139,28 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 		# marker reconcile in step 5.
 		if [ "$DL_RC" = 0 ] && grep -q 'downloaded=1' "$DL_OUT" 2>/dev/null && [ -s "$ROM" ]; then
 			DL_OK=1
+		elif [ ! -s "$ROM" ]; then
+			# RETRY ONCE: a first --download can race a tunnel that only just reached Running
+			# (the DERP handshake completing a beat after BackendState flips). Re-confirm the
+			# tunnel and try again before giving up — cheap insurance against a cold-start race.
+			log "fetch-on-launch: first --download did not land - retry once"
+			ensure_tunnel_up >> "$LOG" 2>&1
+			engine --download "$ROM" > "$DL_OUT" 2>&1; DL_RC=$?
+			cat "$DL_OUT" >> "$LOG" 2>/dev/null
+			if [ "$DL_RC" = 0 ] && grep -q 'downloaded=1' "$DL_OUT" 2>/dev/null && [ -s "$ROM" ]; then
+				DL_OK=1
+			fi
 		fi
 		rm -f "$DL_OUT" 2>/dev/null
-	else
-		log "fetch-on-launch: no network"
 	fi
 	if [ ! -s "$ROM" ]; then
 		phase "Download failed - returning to menu"
 		# HONEST, LOUD failure (feedback_no_fake_ui_state): show a real error on-screen and
-		# hold it long enough to read before muOS redraws the menu - no silent abort.
-		if wifi_is_up; then
+		# hold it long enough to read before muOS redraws the menu - no silent abort. The
+		# message names the REAL cause + the REAL fix.
+		if [ "$TS_FAIL" = 1 ]; then
+			splash "Can't reach your server" "Tailscale isn't connected. Check Wi-Fi, or open Lodor -> Tailscale -> Reconnect, then launch again." bad
+		elif wifi_is_up; then
 			splash "Download failed" "Couldn't download $NAME. The server or transfer failed - check your RomM server, then launch again." bad
 		else
 			splash "No Wi-Fi" "Can't download $NAME while offline. Connect Wi-Fi in muOS Settings, then launch again." bad
@@ -114,7 +176,9 @@ fi
 # --- 2. Save pull-before: OPPORTUNISTIC. Never bring Wi-Fi up just to pull (that adds a
 # cold-bring-up delay to every launch). Pull only when the radio is ALREADY up - e.g. we
 # just downloaded the stub (radio warm) or the user enabled Wi-Fi. Hard-bounded. ----------
-if [ -n "$ROM" ] && wifi_is_up; then
+# server_reachable (not bare wifi_is_up): a tier-1 host also needs the tunnel Running, else
+# this pull would burn its full 25s timeout on a dead SOCKS5 dial on every launch.
+if [ -n "$ROM" ] && server_reachable; then
 	# CWD FIX: cd in the subshell so config.json resolves; timeout wraps the engine inside it.
 	if command -v timeout >/dev/null 2>&1; then
 		( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (pull)"; exec timeout 25 "$BIN" --sync-save "$ROM" ) >> "$LOG" 2>&1
@@ -166,7 +230,9 @@ if [ -n "$ROM" ] && [ -e "$INGAME_LOCK" ]; then
 		-o -iname "$_rb_g.mpk" -o -iname "$_rb_g.nv" -o -iname "$_rb_g.rtc" \
 		-o -iname "$_rb_g.state*" \
 	\) 2>/dev/null | grep -q .; then
-		if wifi_is_up; then
+		# server_reachable, not bare wifi_is_up: a tier-1 host with the tunnel down would
+		# otherwise fail the push after a full timeout — queue it for the daemon instead.
+		if server_reachable; then
 			engine --sync-save "$ROM" >> "$LOG" 2>&1 || { grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"; }
 		else
 			grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"
