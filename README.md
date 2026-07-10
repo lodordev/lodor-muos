@@ -76,7 +76,23 @@ App/Lodor/
 test/
   check.sh               # shell-surface gate (parse + shellcheck)
   integ-harness.sh       # end-to-end sandbox harness (real card image, qemu engine)
+  mockromm.go            # loopback RomM stand-in for the offline harness legs
 ```
+
+## Cross-device "Continue" (native History injection)
+
+muOS has no MinUI-style `recent.txt`; its History menu (`muxhistory`) renders one
+pointer file per game under `MUOS/info/history` (`/run/muos/storage/info/history`
+at runtime) — `<name>-<FNV1a-32-of-path>.cfg`, three lines (rom path / system
+folder / content name), ordered by file **mtime**. The engine's `--sync-continue`
+(the fast "Sync now" leg; the full Refresh runs the same delivery) materializes
+the cross-device RomM feed as those pointer files, mtime-stamped to each save's
+**server** `updated_at` — games played on another device surface in muOS's own
+History, in true recency order, with zero launcher changes. Injected entries
+launch through the standard assign/override pipeline, so download-on-launch and
+the save bracket apply. Pointers the engine did not create are never touched (the
+user's real history is sacred); a stale Lodor pointer stranded by the ✘→✓
+download rename is re-keyed to the live name.
 
 ## Notes
 

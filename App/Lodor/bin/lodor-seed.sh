@@ -90,4 +90,10 @@ EOF
 fi
 
 log "seed: overrides=$seeded skipped=$skipped (RetroArch folders get launch interception; standalone untouched)"
+
+# Stamp the SETTLED post-seed signal (#180B). Stamping HERE - not in mux_launch - means
+# EVERY seed path (app launch, boot hook, wizard post-mirror re-seed) leaves a fresh
+# stamp, so the next launch's gate can skip and no path strands a stale stamp behind.
+lodor_seed_signal > "$SEED_STAMP" 2>/dev/null
+
 echo "SEED overrides=$seeded skipped=$skipped"

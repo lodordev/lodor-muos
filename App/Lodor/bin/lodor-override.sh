@@ -27,6 +27,18 @@ done
 
 NAME="$1"; CORE="$2"; ROM="${3%/}"
 
+# Display-only: strip the leading cloud/on-device marker for on-screen splashes.
+# muOS passes the raw on-disk name (e.g. "✘ Game"); the ✘/✓ glyphs are non-ASCII and
+# the splash font is ASCII-only, so they render as "?????". Keep $NAME raw for the ROM path
+# (the file on the card genuinely carries the marker); use $NAME_DISP only for user-facing text.
+NAME_DISP="$NAME"
+case "$NAME_DISP" in
+	"✘ "*)   NAME_DISP="${NAME_DISP#✘ }" ;;
+	"✓ "*)   NAME_DISP="${NAME_DISP#✓ }" ;;
+	"[^] "*)  NAME_DISP="${NAME_DISP#\[^\] }" ;;
+	"[v] "*)  NAME_DISP="${NAME_DISP#\[v\] }" ;;
+esac
+
 # If the lib is missing, we MUST still launch the game (never brick a launch). Fall back to
 # muOS's stock launcher directly and exit.
 if [ -z "$LIB" ]; then
@@ -113,7 +125,7 @@ log "save subdir=${LODOR_SAVE_SUBDIR:-<engine default>}"
 DL_OK=0
 if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	phase "Downloading $NAME..."
-	splash "Downloading" "$NAME" good   # visible on-screen feedback (user feedback #6)
+	splash "Downloading" "$NAME_DISP" good   # visible on-screen feedback (user feedback #6)
 	NET_OK=0; TS_FAIL=0
 	if wifi_bring_up; then
 		# tier-1 (Tailscale) host: the tunnel MUST be Running before --download (the engine
@@ -161,9 +173,9 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 		if [ "$TS_FAIL" = 1 ]; then
 			splash "Can't reach your server" "Tailscale isn't connected. Check Wi-Fi, or open Lodor -> Tailscale -> Reconnect, then launch again." bad
 		elif wifi_is_up; then
-			splash "Download failed" "Couldn't download $NAME. The server or transfer failed - check your RomM server, then launch again." bad
+			splash "Download failed" "Couldn't download $NAME_DISP. The server or transfer failed - check your RomM server, then launch again." bad
 		else
-			splash "No Wi-Fi" "Can't download $NAME while offline. Connect Wi-Fi in muOS Settings, then launch again." bad
+			splash "No Wi-Fi" "Can't download $NAME_DISP while offline. Connect Wi-Fi in muOS Settings, then launch again." bad
 		fi
 		log "fetch-on-launch FAILED (rom still empty) - abort launch"
 		sleep 4
@@ -173,14 +185,23 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	phase "Downloaded $NAME"
 fi
 
-# --- 2. Save pull-before: OPPORTUNISTIC. Never bring Wi-Fi up just to pull (that adds a
-# cold-bring-up delay to every launch). Pull only when the radio is ALREADY up - e.g. we
-# just downloaded the stub (radio warm) or the user enabled Wi-Fi. Hard-bounded. ----------
-# server_reachable (not bare wifi_is_up): a tier-1 host also needs the tunnel Running, else
-# this pull would burn its full 25s timeout on a dead SOCKS5 dial on every launch.
+# --- 2. Launch gate (Handoff, task #24 - 2026-07-07): OPPORTUNISTIC, never a
+# cold Wi-Fi bring-up. When the server is ALREADY reachable, the wizard probes for
+# anything NEWER (save lineage; unseen compatible state) and shows the interactive
+# launch card ONLY then - silent instant pass-through otherwise. Bounded by timeout;
+# any failure falls through to launch. Wizard absent -> the old silent save pull.
+# server_reachable (not bare wifi_is_up): a tier-1 host also needs the tunnel Running.
 if [ -n "$ROM" ] && server_reachable; then
-	# CWD FIX: cd in the subshell so config.json resolves; timeout wraps the engine inside it.
-	if command -v timeout >/dev/null 2>&1; then
+	lodor_ensure_device
+	_WIZ="$APPDIR/lodor-wizard"
+	# CWD FIX: cd in the subshell so config.json resolves; timeout wraps the tool inside it.
+	if [ -x "$_WIZ" ]; then
+		if command -v timeout >/dev/null 2>&1; then
+			( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (card)"; LODOR_BIN="$BIN" exec timeout 90 "$_WIZ" --launch-card "$ROM" ) >> "$LOG" 2>&1 || log "launch-card skipped (non-blocking)"
+		else
+			( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (card)"; LODOR_BIN="$BIN" "$_WIZ" --launch-card "$ROM" ) >> "$LOG" 2>&1 || log "launch-card skipped (non-blocking)"
+		fi
+	elif command -v timeout >/dev/null 2>&1; then
 		( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (pull)"; exec timeout 25 "$BIN" --sync-save "$ROM" ) >> "$LOG" 2>&1
 	else
 		engine --sync-save "$ROM" >> "$LOG" 2>&1
@@ -203,6 +224,12 @@ fi
 if [ -n "$ROM" ] && [ -e "$INGAME_LOCK" ]; then
 	_rb=$(basename "$ROM"); _rbne="${_rb%.*}"
 	SAVES="${SAVES_DIR:-/run/muos/storage/save/file}"
+	# STATE-DIR FIX (2026-07-06): muOS keeps savestates in the SIBLING save/state tree
+	# (retroarch.default.cfg: savestate_directory=/run/muos/storage/save/state, verified
+	# from MustardOS source) — save/file is battery saves only, so the .state* patterns
+	# below never matched there and a savestate-only session never triggered the
+	# post-game sync. Scan both roots; a missing dir is swallowed by find 2>/dev/null.
+	STATES="${STATES_DIR:-/run/muos/storage/save/state}"
 	# CLOCK-FIX (2026-06-30): dropped the fragile -newer "$INGAME_LOCK" mtime test. A stale
 	# device clock made a just-written save look OLDER than launch, so the push was silently
 	# skipped and the save never reached RomM. Name-filter only now; the engine MD5-dedups
@@ -218,7 +245,7 @@ if [ -n "$ROM" ] && [ -e "$INGAME_LOCK" ]; then
 	# the `[`->`[[]` pass can't re-mangle a just-emitted bracket, then placeholder->`[]]`.
 	_rb_g=$(printf %s "$_rb" | sed -e 's/\]/@LODORRB@/g' -e 's/\[/[[]/g' -e 's/@LODORRB@/[]]/g')
 	_rbne_g=$(printf %s "$_rbne" | sed -e 's/\]/@LODORRB@/g' -e 's/\[/[[]/g' -e 's/@LODORRB@/[]]/g')
-	if find "$SAVES" \( \
+	if find "$SAVES" "$STATES" \( \
 		-iname "$_rbne_g.srm" -o -iname "$_rbne_g.sav" -o -iname "$_rbne_g.dsv" \
 		-o -iname "$_rbne_g.mcr" -o -iname "$_rbne_g.mcd" -o -iname "$_rbne_g.brm" \
 		-o -iname "$_rbne_g.eep" -o -iname "$_rbne_g.sra" -o -iname "$_rbne_g.fla" \
@@ -233,11 +260,22 @@ if [ -n "$ROM" ] && [ -e "$INGAME_LOCK" ]; then
 		# server_reachable, not bare wifi_is_up: a tier-1 host with the tunnel down would
 		# otherwise fail the push after a full timeout — queue it for the daemon instead.
 		if server_reachable; then
+			lodor_ensure_device
 			engine --sync-save "$ROM" >> "$LOG" 2>&1 || { grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"; }
 		else
 			grep -qxF "$ROM" "$PENDING" 2>/dev/null || echo "$ROM" >> "$PENDING"
 			log "save changed, offline -> queued pending"
 		fi
+	fi
+	# Handoff v1: push new save STATES too (additive; engine dedups vs its
+	# ledger; dark without statecores.json). Never blocks the exit bracket.
+	# Offline queues into pending-states.txt (instant); online drains the queue
+	# after the current rom's push.
+	if server_reachable; then
+		engine --push-states "$ROM" >> "$LOG" 2>&1 || log "push-states failed (non-blocking)"
+		engine --push-pending-states >> "$LOG" 2>&1 || log "push-pending-states failed (non-blocking)"
+	else
+		engine --queue-state "$ROM" >> "$LOG" 2>&1 || log "queue-state failed (non-blocking)"
 	fi
 fi
 

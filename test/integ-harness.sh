@@ -44,6 +44,11 @@ docker run --rm -v "$REPO":/w -w /w/engine -e CGO_ENABLED=0 -e GOARCH=arm64 \
 docker run --rm -v "$REPO":/w -w /w/engine -e CGO_ENABLED=0 -e GOARCH=arm64 \
 	golang:1.25-bookworm go build -tags muos -trimpath -ldflags "-s -w" \
 	-o /w/engine/.integ-out-wizard ./cmd/lodor-wizard || { echo "FATAL: wizard build failed"; exit 1; }
+# mock RomM (host arch — runs natively beside the sandbox; #181 offline history leg).
+# Ad-hoc single-file build: mockromm.go lives outside the engine module on purpose.
+docker run --rm -v "$REPO":/w -w /w/integrations/muos/test -e CGO_ENABLED=0 \
+	golang:1.25-bookworm go build -o /w/engine/.integ-out-mockromm mockromm.go \
+	|| { echo "FATAL: mockromm build failed"; exit 1; }
 
 echo "=== menu-row assertions: unit-test the PURE management-menu spine + ScrollMenu ==="
 # The management menu lives in the Go wizard (muOS can't hook the stock launcher). Its row
@@ -64,6 +69,7 @@ mkdir -p "$SB/opt-muos/script/var" "$SB/opt-muos/script/launch" \
 	"$SB/mmc/Roms" "$SB/sysnet/wlan0" "$SB/fakebin" "$SB/capture"
 mv "$REPO/engine/.integ-out-sync" "$SB/lodor-sync"
 mv "$REPO/engine/.integ-out-wizard" "$SB/lodor-wizard"
+mv "$REPO/engine/.integ-out-mockromm" "$SB/mockromm"
 OM="$SB/opt-muos"
 
 echo "=== mount image read-only, extract real /opt/muos bits ==="
@@ -123,15 +129,32 @@ fi
 mkdir -p "$SB/mmc/Roms/Sega Game Gear"
 printf 'NOTASTUB' > "$SB/mmc/Roms/Sega Game Gear/5 in 1 FunPak (USA).gg"
 
+echo "=== start the mock RomM (loopback; #181 offline history leg) ==="
+MOCKPORT="${LODOR_MOCKPORT:-8199}"
+"$SB/mockromm" -addr "127.0.0.1:$MOCKPORT" > "$SB/mockromm.log" 2>&1 &
+MOCKPID=$!
+trap 'kill "$MOCKPID" 2>/dev/null' EXIT
+i=0
+while [ "$i" -lt 25 ]; do
+	if command -v curl >/dev/null 2>&1; then
+		curl -sf "http://127.0.0.1:$MOCKPORT/api/heartbeat" >/dev/null 2>&1 && break
+	else
+		wget -q -O /dev/null "http://127.0.0.1:$MOCKPORT/api/heartbeat" 2>/dev/null && break
+	fi
+	i=$((i + 1)); sleep 1
+done
+kill -0 "$MOCKPID" 2>/dev/null || { echo "FATAL: mock RomM died on startup"; sed -n 1,5p "$SB/mockromm.log"; exit 1; }
+echo "mock RomM up on 127.0.0.1:$MOCKPORT (pid $MOCKPID)"
+
 echo
 echo "########## RUN UNDER mount-namespace bind mounts ##########"
 # NOTE: sandbox roms live under mmc/Roms (not the card's ROMS): panther's FS is
 # case-SENSITIVE while the card's exFAT is not, and the engine's shared catalog joins
 # sdcardRoot()+"/Roms". One spelling keeps shell+engine agreeing off-hardware; on the
 # card both land in /mnt/mmc/ROMS. (Tracked engine cleanup; do not fix here.)
-unshare -m sh -s "$SB" "$LIVE" <<'NS'
+unshare -m sh -s "$SB" "$LIVE" "$MOCKPORT" <<'NS'
 set -u
-SB="$1"; LIVE="$2"
+SB="$1"; LIVE="$2"; MOCKPORT="$3"
 mkdir -p /opt/muos /run/muos/storage
 mount --bind "$SB/opt-muos" /opt/muos
 mount --bind "$SB/storage" /run/muos/storage
@@ -143,6 +166,32 @@ export ROMS_DIR="$SB/mmc/Roms"
 export SDCARD_PATH="$SB/mmc"
 fails=0
 
+echo "===== TEST 0: seed-gate skips on identical sig in the ZERO-OVERRIDE state (#180B) ====="
+# The 2026-07-05 RG40XXV field bug: fresh install, ROMS empty -> zero overrides is the
+# SETTLED state, but the old gate's have_override conjunct forced a re-seed every launch
+# with an IDENTICAL sig. Reproduce: empty roms dir, gate twice -> exactly one re-seed,
+# then a skip. (set +u: the sourced lib + the card's func.sh predate this harness's -u.)
+EMPTYROMS="$SB/mmc-empty"; mkdir -p "$EMPTYROMS"
+: > "$APP/romm.log"
+(
+	set +u
+	ROMS_DIR="$EMPTYROMS"; export ROMS_DIR
+	. "$APP/lib/romm-sync-lib.sh"
+	lodor_export_env
+	lodor_seed_gated "$APP/bin/lodor-seed.sh"
+	lodor_seed_gated "$APP/bin/lodor-seed.sh"
+)
+g_seed=$(grep -c "seed-gate: re-seeded" "$APP/romm.log" || true)
+g_skip=$(grep -c "seed-gate: unchanged" "$APP/romm.log" || true)
+if [ "$g_seed" = 1 ] && [ "$g_skip" = 1 ]; then
+	echo "ok: zero-override gate = 1 re-seed + 1 skip (field bug fixed)"
+else
+	echo "FAIL: zero-override gate re-seed=$g_seed skip=$g_skip (want 1/1)"; fails=$((fails+1))
+	grep "seed-gate" "$APP/romm.log" | tail -4
+fi
+rm -f "$APP/.seed-stamp"   # fresh gate state for the real-library tests below
+
+echo
 echo "===== TEST 1: lodor-seed.sh (RetroArch folder seeded, standalone skipped) ====="
 mkdir -p "$SB/mmc/Roms/Sony PlayStation Portable"; : > "$SB/mmc/Roms/Sony PlayStation Portable/dummy.iso"
 "$APP/bin/lodor-seed.sh"
@@ -152,6 +201,36 @@ OV="/opt/muos/share/info/override/Sega Game Gear.sh"
 	&& { echo "FAIL: standalone PSP got an override"; fails=$((fails+1)); } \
 	|| echo "ok: standalone PSP skipped"
 [ -f "/run/muos/storage/init/00-lodor.sh" ] && echo "ok: boot hook present" || { echo "FAIL: boot hook missing"; fails=$((fails+1)); }
+
+echo
+echo "===== TEST 1b: seeder self-stamps; gate skips the very next launch (#180B) ====="
+# TEST 1 ran lodor-seed.sh DIRECTLY (not via the gate) — with the fix the seeder stamps
+# itself, so a gate call right after must skip with 'unchanged'. Proves the stamp is
+# honored ACROSS processes with overrides present (the non-empty-library skip path).
+[ -s "$APP/.seed-stamp" ] && echo "ok: seeder wrote its own stamp" || { echo "FAIL: no .seed-stamp after direct seed"; fails=$((fails+1)); }
+: > "$APP/romm.log"
+( set +u; . "$APP/lib/romm-sync-lib.sh"; lodor_export_env; lodor_seed_gated "$APP/bin/lodor-seed.sh" )
+if grep -q "seed-gate: unchanged (sig .*) - skip" "$APP/romm.log"; then
+	echo "ok: identical-sig launch skips (stamp honored)"
+else
+	echo "FAIL: gate did not skip on identical sig:"; grep "seed-gate" "$APP/romm.log" | tail -2; fails=$((fails+1))
+fi
+
+echo
+echo "===== TEST 1c: wizard --reseed wires overrides IN-SESSION (post-mirror seam, #180A) ====="
+# Simulate the post-mirror state WITHOUT an app relaunch: kill the override + stamp, then
+# run the wizard's re-seed hook (the same code screenMirrorArgs calls after a successful
+# mirror). The override must come back and the honest overrides=N line must be logged.
+rm -f "/opt/muos/share/info/override/Sega Game Gear.sh" "$APP/.seed-stamp" "$APP/wizard.log"
+# LODOR_PAK_DIR: on-device mux_launch exports it (lodor_export_env) before the wizard
+# runs — without it dataDir() is empty and wizard.log is never written. Mirror that.
+LODOR_PAK_DIR="$APP" "$APP/lodor-wizard" --reseed >/dev/null 2>&1
+[ -L "/opt/muos/share/info/override/Sega Game Gear.sh" ] \
+	&& echo "ok: override re-wired in-session (no app relaunch)" \
+	|| { echo "FAIL: wizard --reseed did not wire the override"; fails=$((fails+1)); }
+grep -q "seed: post-mirror re-seed, overrides=" "$APP/wizard.log" 2>/dev/null \
+	&& echo "ok: honest overrides count logged" \
+	|| { echo "FAIL: post-mirror re-seed log line missing"; fails=$((fails+1)); }
 
 echo
 echo "===== TEST 2: launch a REAL rom via the override (dispatch + save -> pending) ====="
@@ -218,6 +297,106 @@ for ph in "wizard: start" "fb open " "input open " "configured=" \
 done
 [ "$pmiss" = 0 ] && echo "ok: all 8 startup phase lines emitted (hang next time is localizable)" || fails=$((fails+pmiss))
 
+echo
+echo "===== TEST 5: cross-device Continue -> muOS NATIVE History (#181; mock RomM, offline) ====="
+# The engine's --sync-continue must materialize the cross-device feed as muOS's own
+# info/history pointer files: <name>-<FNV1a8>.cfg, 3 lines, mtime = the SERVER save
+# time (muxhistory orders by mtime). Foreign (user-written) pointers are sacred.
+HIST="/run/muos/storage/info/history"
+MOCKAPP="$SB/mockapp"
+rm -rf "$MOCKAPP" "$HIST"; mkdir -p "$MOCKAPP" "$HIST"
+cp "$SB/lodor-sync" "$MOCKAPP/lodor-sync"; chmod +x "$MOCKAPP/lodor-sync"
+cat > "$MOCKAPP/config.json" <<CFG
+{"hosts":[{"root_uri":"http://127.0.0.1:$MOCKPORT","token":"mock-token","device_id":"mock-dev","device_name":"Harness"}],"directory_mappings":{"gamegear":{"slug":"gamegear","relative_path":"Sega Game Gear"}},"api_timeout":10,"download_timeout":60}
+CFG
+cat > "$MOCKAPP/catalog-index.json" <<'IDX'
+{"version":1,"platforms":{"gamegear":{"by_id":{"71":"/Roms/Sega Game Gear/✘ Zilion (USA).gg","72":"/Roms/Sega Game Gear/Real Game (USA).gg"}}}}
+IDX
+: > "$SB/mmc/Roms/Sega Game Gear/✘ Zilion (USA).gg"
+printf 'REALBYTES' > "$SB/mmc/Roms/Sega Game Gear/Real Game (USA).gg"
+# A FOREIGN native pointer (the user's own history) — must survive byte- and mtime-identical.
+FOREIGN="$HIST/Foreign Keeper-00C0FFEE.cfg"
+printf '%s\n%s\n%s' "/mnt/mmc/ROMS/Sega Game Gear/Foreign Keeper.gg" "Sega Game Gear" "Foreign Keeper" > "$FOREIGN"
+touch -d "2026-06-01 08:00:00 UTC" "$FOREIGN"
+F_MT0=$(stat -c %Y "$FOREIGN")
+( cd "$MOCKAPP" && LODOR_PAK_DIR="$MOCKAPP" ./lodor-sync --sync-continue > out.txt 2> err.txt ); rc=$?
+[ "$rc" = 0 ] && echo "ok: --sync-continue rc=0 against the mock" \
+	|| { echo "FAIL: --sync-continue rc=$rc"; sed -n 1,5p "$MOCKAPP/err.txt"; fails=$((fails+1)); }
+# #187: muOS builds write NO MinUI Continue collection file — entries reports 0
+# by design; the native-History injection below is the real delivery signal.
+grep -q "^CONTINUE entries=0" "$MOCKAPP/out.txt" \
+	&& echo "ok: CONTINUE entries=0 (muOS #187 contract: native History owns delivery)" \
+	|| { echo "FAIL: CONTINUE line: $(cat "$MOCKAPP/out.txt" 2>/dev/null)"; fails=$((fails+1)); }
+# ANTI-TRIVIAL (knulli leg-3 rule): the injector must report it actually WROTE.
+grep -q "MUOS-HISTORY injected=2 rekeyed=0 skipped=0" "$MOCKAPP/err.txt" \
+	&& echo "ok: injector WROTE (injected=2 - not the no-op class)" \
+	|| { echo "FAIL: injector report: $(grep MUOS-HISTORY "$MOCKAPP/err.txt" 2>/dev/null)"; fails=$((fails+1)); }
+ZCFG=$(find "$HIST" -name "✘ Zilion (USA)-*.cfg" | head -1)
+RCFG=$(find "$HIST" -name "Real Game (USA)-*.cfg" | head -1)
+for f in "$ZCFG" "$RCFG"; do
+	case "$(basename "$f" .cfg)" in
+	*-[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]) : ;;
+	*) echo "FAIL: pointer filename lacks the -HASH8 suffix muOS writes: $f"; fails=$((fails+1)) ;;
+	esac
+done
+# EXACT bytes: 3 lines, real ROMS paths, NO trailing newline (content.c's fprintf shape).
+printf '%s\n%s\n%s' "$ROMS_DIR/Sega Game Gear/✘ Zilion (USA).gg" "Sega Game Gear" "✘ Zilion (USA)" \
+	| cmp -s - "$ZCFG" \
+	&& echo "ok: stub pointer content byte-exact (path/system_sub/content_name)" \
+	|| { echo "FAIL: stub pointer content wrong:"; cat "$ZCFG"; echo; fails=$((fails+1)); }
+printf '%s\n%s\n%s' "$ROMS_DIR/Sega Game Gear/Real Game (USA).gg" "Sega Game Gear" "Real Game (USA)" \
+	| cmp -s - "$RCFG" \
+	&& echo "ok: real-rom pointer content byte-exact" \
+	|| { echo "FAIL: real-rom pointer content wrong:"; cat "$RCFG"; echo; fails=$((fails+1)); }
+# MTIMES = the mock's save times (SERVER clock, #147), which is also the menu order.
+T71=$(date -u -d "2026-07-01 10:00:00 UTC" +%s)
+T72=$(date -u -d "2026-07-02 10:00:00 UTC" +%s)
+ZMT=$(stat -c %Y "$ZCFG" 2>/dev/null || echo 0)
+RMT=$(stat -c %Y "$RCFG" 2>/dev/null || echo 0)
+[ "$ZMT" = "$T71" ] && [ "$RMT" = "$T72" ] \
+	&& echo "ok: mtimes = feed save times exactly (never local now())" \
+	|| { echo "FAIL: mtimes z=$ZMT (want $T71) r=$RMT (want $T72)"; fails=$((fails+1)); }
+[ "$RMT" -gt "$ZMT" ] \
+	&& echo "ok: newest save carries newest mtime (muxhistory order)" \
+	|| { echo "FAIL: mtime order inverted"; fails=$((fails+1)); }
+# FOREIGN pointer: byte- and mtime-identical, never adopted into the manifest.
+printf '%s\n%s\n%s' "/mnt/mmc/ROMS/Sega Game Gear/Foreign Keeper.gg" "Sega Game Gear" "Foreign Keeper" \
+	| cmp -s - "$FOREIGN" \
+	&& [ "$(stat -c %Y "$FOREIGN")" = "$F_MT0" ] \
+	&& echo "ok: foreign/user history preserved (bytes + mtime)" \
+	|| { echo "FAIL: foreign pointer touched"; fails=$((fails+1)); }
+grep -q "Foreign Keeper" "$MOCKAPP/mirror-manifest.json" 2>/dev/null \
+	&& { echo "FAIL: foreign pointer entered the manifest"; fails=$((fails+1)); } \
+	|| echo "ok: foreign pointer not claimed by the manifest"
+n=$(find "$HIST" -name "*.cfg" | wc -l)
+[ "$n" = 3 ] && echo "ok: exactly 3 pointers (2 injected + 1 foreign, no dups)" \
+	|| { echo "FAIL: history holds $n pointers, want 3"; ls "$HIST"; fails=$((fails+1)); }
+grep -q '"history"' "$MOCKAPP/mirror-manifest.json" 2>/dev/null \
+	&& echo "ok: injected pointers manifest-tracked (kind history)" \
+	|| { echo "FAIL: no kind-history manifest entries"; fails=$((fails+1)); }
+# RE-RUN: no churn — same feed must rewrite nothing and move no mtime.
+( cd "$MOCKAPP" && LODOR_PAK_DIR="$MOCKAPP" ./lodor-sync --sync-continue > out2.txt 2> err2.txt )
+grep -q "MUOS-HISTORY injected=0 rekeyed=0 skipped=2" "$MOCKAPP/err2.txt" \
+	&& [ "$(stat -c %Y "$ZCFG")" = "$ZMT" ] \
+	&& echo "ok: repeat sync is a no-op (no mtime churn, no false recency)" \
+	|| { echo "FAIL: repeat sync churned: $(grep MUOS-HISTORY "$MOCKAPP/err2.txt" 2>/dev/null)"; fails=$((fails+1)); }
+# MARKER FLIP (download-on-launch ✘ -> ✓): the stale ✘ pointer is DEAD to muxhistory;
+# the injector must re-key it to the live on-card name (index left stale on purpose —
+# resolveOnCardRel resolves marker variants from the CARD, the #135 rule).
+mv "$SB/mmc/Roms/Sega Game Gear/✘ Zilion (USA).gg" "$SB/mmc/Roms/Sega Game Gear/✓ Zilion (USA).gg"
+( cd "$MOCKAPP" && LODOR_PAK_DIR="$MOCKAPP" ./lodor-sync --sync-continue > out3.txt 2> err3.txt )
+VCFG=$(find "$HIST" -name "✓ Zilion (USA)-*.cfg" | head -1)
+if [ -n "$VCFG" ] && [ ! -e "$ZCFG" ]; then
+	echo "ok: marker flip re-keyed the pointer (stale ✘ gone, live ✓ present)"
+	[ "$(stat -c %Y "$VCFG")" = "$T71" ] \
+		&& echo "ok: re-keyed pointer keeps the feed mtime" \
+		|| { echo "FAIL: re-keyed mtime $(stat -c %Y "$VCFG") != $T71"; fails=$((fails+1)); }
+else
+	echo "FAIL: marker flip not re-keyed (✓=$VCFG stale-still-there=$([ -e "$ZCFG" ] && echo yes || echo no))"
+	grep MUOS-HISTORY "$MOCKAPP/err3.txt" 2>/dev/null; fails=$((fails+1))
+fi
+rm -f "$SB/mmc/Roms/Sega Game Gear/✓ Zilion (USA).gg" "$SB/mmc/Roms/Sega Game Gear/Real Game (USA).gg"
+
 if [ "$LIVE" = 1 ]; then
 	echo
 	echo "===== LIVE: engine --validate (token check against the real RomM) ====="
@@ -244,6 +423,19 @@ if [ "$LIVE" = 1 ]; then
 	echo "stub count on card: $stubs"
 	[ "$stubs" -gt 0 ] || { echo "FAIL: no stubs mirrored"; fails=$((fails+1)); }
 	[ -f "$APP/catalog-index.json" ] && echo "ok: catalog-index.json written" || { echo "FAIL: no catalog-index.json"; fails=$((fails+1)); }
+
+	echo
+	echo "===== LIVE: post-mirror in-session re-seed — overrides WITHOUT relaunch (#180A) ====="
+	# The mirror above may have created NEW system folders. On-device the wizard re-seeds
+	# right after a successful mirror (screenMirrorArgs -> reseedOverrides); run the same
+	# hook here and assert every RA folder is wired IMMEDIATELY — no app relaunch.
+	LODOR_PAK_DIR="$APP" "$APP/lodor-wizard" --reseed >/dev/null 2>&1
+	[ -L "/opt/muos/share/info/override/Sega Game Gear.sh" ] \
+		&& echo "ok: RA override present right after mirror (no relaunch needed)" \
+		|| { echo "FAIL: post-mirror reseed left Game Gear override missing"; fails=$((fails+1)); }
+	[ -e "/opt/muos/share/info/override/Sony PlayStation Portable.sh" ] \
+		&& { echo "FAIL: post-mirror reseed wrongly overrode standalone PSP"; fails=$((fails+1)); } \
+		|| echo "ok: standalone PSP still untouched post-mirror"
 
 	echo
 	echo "===== LIVE: download-on-launch via the override (engine hash-verifies) ====="

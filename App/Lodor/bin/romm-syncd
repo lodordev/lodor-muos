@@ -33,9 +33,14 @@ while :; do
 	last_attempt=$(date +%s)
 	if wifi_bring_up; then
 		set_clock_bounded
+		lodor_ensure_device
 		out="$("$BIN" --push-pending 2>&1)"; rc=$?
 		printf '%s\n' "$out" >> "$LOG"
-		log "push-pending rc=$rc"
+		# Handoff v1: also drain the offline pending-STATES queue (savestates). The launch
+		# hooks queue states on-exit; only this daemon drains them offline. Best-effort — a
+		# stuck state must never wedge the save flush above.
+		"$BIN" --push-pending-states >> "$LOG" 2>&1 || true
+		log "push-pending + push-pending-states rc=$rc"
 	else
 		log "wifi unavailable; retry next interval"
 	fi

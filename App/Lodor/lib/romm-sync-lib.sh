@@ -78,6 +78,60 @@ lodor_roms_dir() {
 log() { echo "$(date +'%F %T') $*" >> "$LOG" 2>/dev/null; }
 phase() { echo "$1" > "$PHASE" 2>/dev/null; }   # HONEST: only call with a confirmed-true line
 
+# --- seed gate (#180B) ------------------------------------------------------------------
+# Shared by mux_launch.sh (the launch gate), lodor-seed.sh (post-seed stamping) and the
+# wizard's post-mirror re-seed. The stamp records the SETTLED post-seed signal; a launch
+# whose live signal matches it skips the seeder entirely.
+SEED_STAMP="$DATA_DIR/.seed-stamp"
+
+# lodor_seed_signal: sorted rom SUBDIR names + a marker + sorted Lodor override SYMLINK
+# names, hashed. Directories only (glob trailing-slash), so transient FILES churning in
+# ROMS (box-art, index/lock files) never move it; the override half is restricted to OUR
+# symlinks so muOS's own override files (if any) don't either. Changes ONLY when a
+# re-seed could change the outcome: a new/removed system folder, or a missing/extra
+# Lodor override (reheal: deleting an override flips the signal and forces a re-seed).
+lodor_seed_signal() {
+	_ssig_roms="${ROMS_DIR:-$(lodor_roms_dir)}"
+	_ssig_ovr="$MUOS_SHARE_DIR/info/override"
+	{
+		for _ssig_d in "$_ssig_roms"/*/; do
+			[ -d "$_ssig_d" ] || continue
+			_ssig_d=${_ssig_d%/}; printf '%s\n' "${_ssig_d##*/}"
+		done
+		printf '@overrides@\n'
+		for _ssig_o in "$_ssig_ovr"/*.sh; do
+			[ -L "$_ssig_o" ] || continue
+			_ssig_o=${_ssig_o%.sh}; printf '%s\n' "${_ssig_o##*/}"
+		done
+	} | sort | (md5sum 2>/dev/null || cksum) | awk '{print $1}'
+}
+
+# lodor_seed_gated <seed-script>: run the seeder only when the live signal differs from
+# the stamp. ROOT CAUSE of the 2026-07-05 RG40XXV field bug (#180B, gate from edf76bd):
+# the old skip condition ALSO required at least one override symlink to exist
+# (have_override) as a "reheal" belt — but ZERO overrides is a legitimate settled state
+# (fresh install before the first mirror, or an all-standalone library), so the gate
+# could never skip there and re-seeded every launch with an IDENTICAL sig. The signal
+# already encodes the override set (a deleted override changes it), so the extra
+# conjunct was redundant where it was right and wrong where it mattered. Sig match =
+# skip, full stop. The stamp itself is written by lodor-seed.sh AFTER a successful seed
+# (settled state), so every seed path — launch, boot hook, wizard post-mirror — leaves
+# a fresh stamp.
+lodor_seed_gated() {
+	_sg_cur="$(lodor_seed_signal)"
+	_sg_old="$(cat "$SEED_STAMP" 2>/dev/null)"
+	if [ -n "$_sg_cur" ] && [ "$_sg_cur" = "$_sg_old" ]; then
+		log "seed-gate: unchanged (sig $_sg_cur) - skip"
+		return 0
+	fi
+	if "$1" >> "$LOG" 2>&1; then
+		log "seed-gate: re-seeded + re-stamped (sig $(cat "$SEED_STAMP" 2>/dev/null))"
+		return 0
+	fi
+	log "seed-gate: seeder FAILED (stamp left as-is; will retry next launch)"
+	return 1
+}
+
 # Export the env the engine needs. ROMS_DIR/SAVES_DIR/BIOS_DIR default correctly inside
 # the muOS engine build, but we pin ROMS_DIR to the live rom mount and the pak dir here.
 lodor_export_env() {
@@ -152,6 +206,28 @@ wifi_bring_up() {
 	done
 	phase "Couldn't connect to $_ssid"   # SPECIFIC, honest - no fake success
 	return 1
+}
+
+# lodor_ensure_device - quiet first-run heal (ported from Knulli, 6b29c2c): a preseeded or
+# card-cloned config carries a token but NO device_id (the release device-state strip is
+# the contract), and every save-sync engine mode hard-requires one - so saves would
+# silently never sync until a full re-onboarding. When the config is paired but
+# unregistered AND the caller already established the network side, register ONCE.
+# Name source: the wizard's default is only a keyboard preset ("RG34XX"), not derivable
+# here - so board devicetree model, else hostname, else "handheld". Callers proceed
+# regardless of the outcome: on failure the engine keeps refusing loudly (honest), and
+# the next reachable save-sync call retries.
+lodor_ensure_device() {
+	[ -f "$DATA_DIR/config.json" ] || return 1
+	grep -q '"device_id"' "$DATA_DIR/config.json" 2>/dev/null && return 0
+	grep -q '"token"' "$DATA_DIR/config.json" 2>/dev/null || return 1
+	_dn=$({ tr -d '\0' < /sys/firmware/devicetree/base/model; } 2>/dev/null)
+	[ -n "$_dn" ] || _dn=$(hostname 2>/dev/null)
+	[ -n "$_dn" ] || _dn="handheld"
+	log "paired-but-unregistered config - registering device as: $_dn"
+	phase "First run - registering this device..."
+	( cd "$DATA_DIR" 2>/dev/null && "$BIN" --register-device "$_dn" ) >> "$LOG" 2>&1 \
+		|| log "device registration failed (will retry next time the server is reachable)"
 }
 
 # --- clock: bounded NTP after we're online (true post-online step) ---------------------

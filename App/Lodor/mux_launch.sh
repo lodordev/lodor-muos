@@ -33,56 +33,22 @@ for g in "$MUOS_STORE_DIR/theme/active/glyph/muxapp" /opt/muos/default/MUOS/them
 	[ -d "$g" ] && [ -f "$SELF_DIR/glyph/romm.png" ] && cp -f "$SELF_DIR/glyph/romm.png" "$g/romm.png" 2>/dev/null
 done
 
-# Perf (G3): SEED-GATE. lodor-seed.sh is idempotent but re-derives every launch override on
-# every open (the RG34XX field log showed overrides=17 EVERY launch despite a stamp present) -
-# a visible startup cost. ROOT CAUSE of that churn: the old signal was
-#   ls -1 "$ROMS_DIR" | sort | md5sum
-# over the WHOLE rom-dir listing - which includes transient NON-directory entries (box-art the
-# cover daemon drops in, catalog index/lock files) AND every system FOLDER the catalog mirror
-# adds after a seed. So the hash differed from the stamp on essentially every launch and the
-# gate never fired.
+# Perf (G3) + #180B: SEED-GATE. lodor-seed.sh is idempotent but re-derives every launch
+# override on every open - a visible startup cost - so it is gated on a STABLE signal
+# (rom SUBDIR set + Lodor override SYMLINK set, hashed) stamped post-seed. The signal,
+# the gate and the stamping now live in lib/romm-sync-lib.sh (lodor_seed_signal /
+# lodor_seed_gated; lodor-seed.sh stamps ITSELF post-seed) so the wizard's post-mirror
+# re-seed (#180A) shares them and every seed path leaves a fresh stamp.
 #
-# FIX: gate on a STABLE signal that changes ONLY when a re-seed is actually needed -
-#   (a) the set of ROM SUBDIRECTORIES (folders only; transient files are ignored), plus
-#   (b) the set of Lodor override SYMLINKS already installed (reheal: a deleted override
-#       re-seeds).
-# and STAMP IT POST-SEED (recompute after the seed settles) so the very next launch, if nothing
-# changed, matches and skips. A genuinely-new rom folder still flips (a) and re-seeds once, then
-# re-stamps and skips - bounded, never per-launch. (Same intent as NextUI's .library-seeded
-# sentinel, hardened against the mirror's folder/file churn.)
-ROMS_DIR_NOW="${ROMS_DIR:-$(lodor_roms_dir)}"
-OVERRIDE_ROOT="$MUOS_SHARE_DIR/info/override"
-SEED_STAMP="$DATA_DIR/.seed-stamp"
-# seed_signal: sorted rom SUBDIR names + a marker + sorted Lodor override SYMLINK names,
-# hashed. Directories only (glob trailing-slash), so files churning in ROMS never move it;
-# override set restricted to OUR symlinks so muOS's own override files (if any) don't either.
-seed_signal() {
-	{
-		for _d in "$ROMS_DIR_NOW"/*/; do
-			[ -d "$_d" ] || continue
-			_d=${_d%/}; printf '%s\n' "${_d##*/}"
-		done
-		printf '@overrides@\n'
-		for _o in "$OVERRIDE_ROOT"/*.sh; do
-			[ -L "$_o" ] || continue
-			_o=${_o%.sh}; printf '%s\n' "${_o##*/}"
-		done
-	} | sort | (md5sum 2>/dev/null || cksum) | awk '{print $1}'
-}
-have_override() { for _o in "$OVERRIDE_ROOT"/*.sh; do [ -L "$_o" ] && return 0; done; return 1; }
-_cur_sig="$(seed_signal)"
-_old_sig="$(cat "$SEED_STAMP" 2>/dev/null)"
-if [ -n "$_cur_sig" ] && [ "$_cur_sig" = "$_old_sig" ] && have_override; then
-	log "seed-gate: rom-dir + override set unchanged -> skip lodor-seed.sh (sig $_cur_sig)"
-else
-	if "$SELF_DIR/bin/lodor-seed.sh" >> "$LOG" 2>&1; then
-		# Recompute AFTER the seed so the stamp records the SETTLED state (overrides just
-		# created). Next launch matches this and skips. (Stamping the PRE-seed signal would
-		# re-churn: the override set differs before vs after the first seed.)
-		seed_signal > "$SEED_STAMP" 2>/dev/null
-		log "seed-gate: re-seeded + re-stamped (sig $(cat "$SEED_STAMP" 2>/dev/null))"
-	fi
-fi
+# HISTORY: the first gate hashed the whole `ls` of ROMS (churned every launch: box-art
+# + mirror folders moved it). The edf76bd fix stabilized the signal but ALSO required
+# at least one override symlink to exist before skipping (have_override) - and ZERO
+# overrides is a legitimate settled state (fresh install pre-mirror, all-standalone
+# library), so THAT gate re-seeded every launch with an IDENTICAL sig (RG40XXV field
+# log 2026-07-05: "re-seeded + re-stamped (sig 878ad0c2...)" twice in a row). The
+# signal already covers the reheal case (a deleted override flips it), so the gate is
+# now: sig match = skip. Full root-cause note on lodor_seed_gated in the lib.
+lodor_seed_gated "$SELF_DIR/bin/lodor-seed.sh"
 
 # Perf (G3): LAZY Tailscale bring-up. NEVER block the menu render on the tunnel. When the
 # device is already onboarded and Tailscale-capable with a persisted login, kick a reconnect
