@@ -9,6 +9,7 @@
 #  MARKER: LODOR_APP
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export LODOR_APPDIR="$SELF_DIR"
+export LODOR_HOST_OS=muos # the wizard's host-OS copy table (lodor#32)
 . "$SELF_DIR/lib/romm-sync-lib.sh"
 lodor_export_env
 

@@ -100,3 +100,10 @@ download rename is re-keyed to the live name.
   against your own server's collection.
 - Saves are matched per libretro corename (read from the card's own core `.info`
   files), exactly where stock RetroArch reads them.
+
+## Related
+
+- [lodor](https://github.com/lodordev/lodor) — the sync engine (all releases publish there too)
+- [lodoros](https://github.com/lodordev/lodoros) — the MinUI-fork flagship for Miyoo devices
+- [lodor-nextui](https://github.com/lodordev/lodor-nextui) — the NextUI (TrimUI) pak
+- [lodor-knulli](https://github.com/lodordev/lodor-knulli) — the Knulli (Batocera-family) port
