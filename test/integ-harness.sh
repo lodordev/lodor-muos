@@ -259,6 +259,44 @@ echo "phase line: $(cat /tmp/romm-phase 2>/dev/null)"
 rm -f "$STUBROM"
 
 echo
+echo "===== TEST 3b: multi-disc incomplete .m3u (lodor#7 disc-1-first), OFFLINE ====="
+# (a) populated .m3u + disc 1 real + disc 2 stub -> the override logs the honest offline
+#     skip (no cold bring-up) and STILL hands off to the launcher: the game plays on the
+#     discs it has — the launch is never gated on later discs.
+MDGG="$SB/mmc/Roms/Sega Game Gear"
+mkdir -p "$MDGG/Chrono Cross (USA)"
+printf '%s\n%s\n' "Chrono Cross (USA)/Chrono Cross (USA) (Disc 1).chd" \
+	"Chrono Cross (USA)/Chrono Cross (USA) (Disc 2).chd" > "$MDGG/Chrono Cross (USA).m3u"
+echo DISC1 > "$MDGG/Chrono Cross (USA)/Chrono Cross (USA) (Disc 1).chd"
+: > "$MDGG/Chrono Cross (USA)/Chrono Cross (USA) (Disc 2).chd"
+( cd / && "$OV" "Chrono Cross" "genesis_plus_gx_libretro.so" "$MDGG/Chrono Cross (USA).m3u" ); rc=$?
+[ "$rc" = 0 ] && echo "ok: override rc=0 on incomplete multi-disc" || { echo "FAIL: override rc=$rc"; fails=$((fails+1)); }
+grep -q "launching on the discs present" "$APP/romm.log" 2>/dev/null \
+	&& echo "ok: honest offline skip logged (no cold bring-up)" \
+	|| { echo "FAIL: missing 'launching on the discs present' log"; fails=$((fails+1)); }
+[ -s "/run/muos/storage/save/file/Genesis Plus GX/Chrono Cross (USA).srm" ] \
+	&& echo "ok: launcher hand-off happened (launch NOT gated on disc 2)" \
+	|| { echo "FAIL: launch was blocked by the incomplete later disc"; fails=$((fails+1)); }
+[ -s "$MDGG/Chrono Cross (USA)/Chrono Cross (USA) (Disc 2).chd" ] \
+	&& { echo "FAIL: disc 2 stub gained bytes offline (fake progress)"; fails=$((fails+1)); } \
+	|| echo "ok: disc 2 stub untouched offline"
+# (b) disc 1 itself missing -> honest abort back to menu (same class as the empty stub):
+#     fetch attempted (no network), loud failure, NO hand-off with a black-screen disc 1.
+mkdir -p "$MDGG/Grandia (USA)"
+printf '%s\n%s\n' "Grandia (USA)/Grandia (USA) (Disc 1).chd" \
+	"Grandia (USA)/Grandia (USA) (Disc 2).chd" > "$MDGG/Grandia (USA).m3u"
+: > "$MDGG/Grandia (USA)/Grandia (USA) (Disc 1).chd"
+: > "$MDGG/Grandia (USA)/Grandia (USA) (Disc 2).chd"
+( cd / && "$OV" "Grandia" "genesis_plus_gx_libretro.so" "$MDGG/Grandia (USA).m3u" ); rc=$?
+[ "$rc" = 0 ] || { echo "FAIL: disc-1-missing abort rc=$rc (must return to menu cleanly)"; fails=$((fails+1)); }
+grep -q "next-disc fetch FAILED (disc 1 still missing)" "$APP/romm.log" 2>/dev/null \
+	&& echo "ok: disc-1-missing failure logged honestly" \
+	|| { echo "FAIL: missing disc-1-missing failure log"; fails=$((fails+1)); }
+[ -f "/run/muos/storage/save/file/Genesis Plus GX/Grandia (USA).srm" ] \
+	&& { echo "FAIL: launcher ran with disc 1 missing (black screen shipped)"; fails=$((fails+1)); } \
+	|| echo "ok: no hand-off with disc 1 missing (honest abort)"
+
+echo
 echo "===== TEST 4: wizard --capture renders every screen to PNG (no fb, no input) ====="
 "$APP/lodor-wizard" --capture "$SB/capture" >/dev/null 2>&1
 n=$(find "$SB/capture" -name "*.png" 2>/dev/null | wc -l)

@@ -185,6 +185,93 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 	phase "Downloaded $NAME"
 fi
 
+# --- 1b. Multi-disc next-disc fetch (lodor#7 disc-1-first). ------------------------------
+# The engine downloads multi-disc games DISC-1-FIRST: a stub fill lands disc 1 + the FULL
+# .m3u with 0-byte stubs for later discs. A populated .m3u is NOT a 0-byte stub, so step 1's
+# gate can never re-trigger for it — this block is the re-trigger. One disc per launch
+# (--fetch-next-disc, idempotent, skips verified discs); the daemon prefetch completes the
+# set in the background. LAUNCH GATE = FIRST DISC ONLY: RetroArch boots the m3u's first
+# entry, so with disc 1 present the game launches even if this fetch fails (never a harder
+# gate than the game needs); a missing disc 1 with no way to fetch it is the same honest
+# abort as an unfilled stub. Skipped when step 1 just filled the stub (disc 1 landed this
+# launch — one disc per launch is the design).
+lodor_m3u_for() {
+	case "$1" in
+		*.m3u) printf '%s' "$1"; return 0 ;;
+	esac
+	_gd=$(dirname "$1"); _pd=$(dirname "$_gd"); _gn=$(basename "$_gd")
+	_cand="$_pd/$_gn.m3u"
+	[ -f "$_cand" ] && printf '%s' "$_cand"
+}
+# 0 (true) if the .m3u lists a disc whose file is missing or 0-byte (busybox-safe scan).
+lodor_m3u_incomplete() {
+	_m="$1"; [ -f "$_m" ] || return 1
+	_dir=$(dirname "$_m"); _any=0
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		[ -n "$_line" ] || continue
+		_any=1
+		case "$_line" in
+			/*) _dp="$_line" ;;
+			*)  _dp="$_dir/$_line" ;;
+		esac
+		[ -s "$_dp" ] || return 0
+	done < "$_m"
+	[ "$_any" = 0 ] && return 0
+	return 1
+}
+# 0 (true) if the FIRST listed disc is missing/0-byte (the launch gate; empty list = broken).
+lodor_m3u_first_missing() {
+	_m="$1"; [ -f "$_m" ] || return 0
+	_dir=$(dirname "$_m")
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		[ -n "$_line" ] || continue
+		case "$_line" in
+			/*) _dp="$_line" ;;
+			*)  _dp="$_dir/$_line" ;;
+		esac
+		[ -s "$_dp" ] && return 1
+		return 0
+	done < "$_m"
+	return 0
+}
+LODOR_M3U="$(lodor_m3u_for "$ROM")"
+if [ -n "$LODOR_M3U" ] && [ -s "$LODOR_M3U" ] && [ "$DL_OK" != 1 ] && lodor_m3u_incomplete "$LODOR_M3U"; then
+	if lodor_m3u_first_missing "$LODOR_M3U"; then
+		# Disc 1 itself is missing (evicted by hand / interrupted first fetch): the game is
+		# unlaunchable without it, so this is the stub path's job — bring the network up.
+		phase "Downloading $NAME_DISP..."
+		splash "Downloading" "$NAME_DISP (disc 1)" good
+		if wifi_bring_up && ensure_tunnel_up; then
+			engine --fetch-next-disc "$LODOR_M3U" >> "$LOG" 2>&1 || log "next-disc fetch (disc 1) failed"
+		else
+			log "next-disc fetch (disc 1): no network"
+		fi
+		if lodor_m3u_first_missing "$LODOR_M3U"; then
+			phase "Download failed - returning to menu"
+			if wifi_is_up; then
+				splash "Download failed" "Couldn't download $NAME_DISP's first disc - check your RomM server, then launch again." bad
+			else
+				splash "No Wi-Fi" "Can't download $NAME_DISP's disc while offline. Connect Wi-Fi in muOS Settings, then launch again." bad
+			fi
+			log "next-disc fetch FAILED (disc 1 still missing) - abort launch (never a black screen)"
+			sleep 4
+			rm -f "$INGAME_LOCK" 2>/dev/null
+			exit 0
+		fi
+	elif server_reachable; then
+		# Disc 1 present: fetch the next missing disc OPPORTUNISTICALLY (no cold bring-up —
+		# an offline relaunch must stay instant). Failure -> the game still launches on the
+		# discs it has; the daemon prefetch or the next online launch completes the set.
+		phase "Downloading $NAME_DISP (next disc)..."
+		splash "Downloading" "$NAME_DISP - fetching the next disc" good
+		engine --fetch-next-disc "$LODOR_M3U" >> "$LOG" 2>&1 \
+			|| log "next-disc fetch failed (non-blocking) - launching on the discs present"
+		phase "Ready"
+	else
+		log "multi-disc incomplete but server not reachable - launching on the discs present (daemon will prefetch)"
+	fi
+fi
+
 # --- 2. Launch gate (Handoff, task #24 - 2026-07-07): OPPORTUNISTIC, never a
 # cold Wi-Fi bring-up. When the server is ALREADY reachable, the wizard probes for
 # anything NEWER (save lineage; unseen compatible state) and shows the interactive

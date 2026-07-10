@@ -18,6 +18,16 @@ last_attempt=$(date +%s)
 # Never leave the radio up if we're killed mid-cycle.
 trap 'rm -f "$INGAME_LOCK" 2>/dev/null' EXIT INT TERM HUP QUIT
 
+# prefetch_work - OFFLINE census (engine --prefetch-discs --dry: manifest walk + file
+# stats, no config/host/network): are there downloaded multi-disc games with missing
+# discs (lodor#7 disc-1-first leaves later discs as 0-byte stubs)? Gates the radio the
+# same way the pending queue does — an empty census means no wakeup. Knob:
+# LODOR_PREFETCH_DISCS=off disables (default on, this lane's env-knob pattern).
+prefetch_work() {
+	[ "${LODOR_PREFETCH_DISCS:-on}" != "off" ] || return 1
+	( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (prefetch census)"; "$BIN" --prefetch-discs --dry 2>/dev/null ) | grep -q 'discs_missing=[1-9]'
+}
+
 log "romm-syncd started (interval=${INTERVAL}s, poll=${POLL}s)"
 
 while :; do
@@ -27,8 +37,9 @@ while :; do
 	is_charging   || continue
 	not_in_game   || continue
 	creds_present || continue
-	# Anything to do? Skip the radio entirely if the queue is empty.
-	[ -s "$PENDING" ] || { last_attempt=$(date +%s); continue; }
+	# Anything to do? Skip the radio entirely if the queue is empty AND no multi-disc
+	# game is waiting on discs (both checks are offline file reads).
+	if [ ! -s "$PENDING" ] && ! prefetch_work; then last_attempt=$(date +%s); continue; fi
 
 	last_attempt=$(date +%s)
 	if wifi_bring_up; then
@@ -40,6 +51,14 @@ while :; do
 		# hooks queue states on-exit; only this daemon drains them offline. Best-effort — a
 		# stuck state must never wedge the save flush above.
 		"$BIN" --push-pending-states >> "$LOG" 2>&1 || true
+		# Multi-disc prefetch (lodor#7 hybrid): after the pending queues drain, quietly
+		# complete any downloaded multi-disc game still missing discs on the SAME warm
+		# link (launches fetch disc-1-first; this makes mid-game disc swaps work without
+		# a relaunch). Best-effort, quietly logged; failures re-surface next census.
+		if [ "${LODOR_PREFETCH_DISCS:-on}" != "off" ]; then
+			( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (prefetch)"; "$BIN" --prefetch-discs ) >> "$LOG" 2>&1 \
+				|| log "prefetch-discs failed (retry next interval)"
+		fi
 		log "push-pending + push-pending-states rc=$rc"
 	else
 		log "wifi unavailable; retry next interval"
