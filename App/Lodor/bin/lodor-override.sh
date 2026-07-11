@@ -186,9 +186,11 @@ if [ -f "$ROM" ] && [ ! -s "$ROM" ]; then
 fi
 
 # --- 1b. Multi-disc next-disc fetch (lodor#7 disc-1-first). ------------------------------
-# The engine downloads multi-disc games DISC-1-FIRST: a stub fill lands disc 1 + the FULL
-# .m3u with 0-byte stubs for later discs. A populated .m3u is NOT a 0-byte stub, so step 1's
-# gate can never re-trigger for it — this block is the re-trigger. One disc per launch
+# The engine downloads multi-disc games DISC-1-FIRST and writes a LOCAL-ONLY .m3u (only
+# discs with real bytes are listed; later discs are folder stubs + a manifest canonical
+# list). A populated .m3u is NOT a 0-byte stub, so step 1's gate can never re-trigger for
+# it — this block is the re-trigger, keyed off `engine --check-rom` (manifest census; the
+# local-only playlist's own refs always read "complete"). One disc per launch
 # (--fetch-next-disc, idempotent, skips verified discs); the daemon prefetch completes the
 # set in the background. LAUNCH GATE = FIRST DISC ONLY: RetroArch boots the m3u's first
 # entry, so with disc 1 present the game launches even if this fetch fails (never a harder
@@ -203,22 +205,14 @@ lodor_m3u_for() {
 	_cand="$_pd/$_gn.m3u"
 	[ -f "$_cand" ] && printf '%s' "$_cand"
 }
-# 0 (true) if the .m3u lists a disc whose file is missing or 0-byte (busybox-safe scan).
-lodor_m3u_incomplete() {
-	_m="$1"; [ -f "$_m" ] || return 1
-	_dir=$(dirname "$_m"); _any=0; _CR=$(printf '\r')
-	while IFS= read -r _line || [ -n "$_line" ]; do
-		_line=${_line%"$_CR"}
-		[ -n "$_line" ] || continue
-		case "$_line" in \#*) continue ;; esac
-		_any=1
-		case "$_line" in
-			/*) _dp="$_line" ;;
-			*)  _dp="$_dir/$_line" ;;
-		esac
-		[ -s "$_dp" ] || return 0
-	done < "$_m"
-	[ "$_any" = 0 ] && return 0
+# 0 (true) if the engine's OFFLINE completeness gate says the disc set is incomplete
+# (RESULT complete=0). Offline by design (--check-rom runs pre-config: filesystem +
+# mirror manifest only — never the radio). FAIL-OPEN: no engine binary / unparseable
+# output -> 1 ("complete") -> no fetch, the launch proceeds exactly as before.
+lodor_rom_incomplete() {
+	[ -x "$BIN" ] || return 1
+	_ckout=$(engine --check-rom "$1" 2>/dev/null)
+	case "$_ckout" in *"complete=0"*) return 0 ;; esac
 	return 1
 }
 # 0 (true) if the FIRST listed disc is missing/0-byte (the launch gate; empty list = broken).
@@ -239,7 +233,7 @@ lodor_m3u_first_missing() {
 	return 0
 }
 LODOR_M3U="$(lodor_m3u_for "$ROM")"
-if [ -n "$LODOR_M3U" ] && [ -s "$LODOR_M3U" ] && [ "$DL_OK" != 1 ] && lodor_m3u_incomplete "$LODOR_M3U"; then
+if [ -n "$LODOR_M3U" ] && [ -s "$LODOR_M3U" ] && [ "$DL_OK" != 1 ] && lodor_rom_incomplete "$LODOR_M3U"; then
 	if lodor_m3u_first_missing "$LODOR_M3U"; then
 		# Disc 1 itself is missing (evicted by hand / interrupted first fetch): the game is
 		# unlaunchable without it, so this is the stub path's job — bring the network up.
