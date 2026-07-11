@@ -15,6 +15,16 @@ log "=== invoke: $1 ==="
 case "$1" in
 	--set-server|-set-server) ;;   # purely local: writes config, no network
 	*)
+		# Transfer mutex FIRST (fg: a user action preempts a background push holder, never
+		# a live non-preemptible one). BUSY is not a network failure — honest copy, no
+		# Wi-Fi claim. Owner-scoped release trap covers every exit path from here on.
+		wifi_acquire fg; _acq=$?
+		if [ "$_acq" != 0 ]; then
+			log "transfer mutex BUSY - leaving engine unrun"
+			phase "Another sync is running — try again shortly"
+			exit 2
+		fi
+		trap 'wifi_release' EXIT INT TERM HUP QUIT
 		if ! wifi_bring_up; then
 			log "wifi_bring_up FAILED - leaving engine unrun"
 			exit 2   # lib already wrote the honest failure phase line

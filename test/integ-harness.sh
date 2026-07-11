@@ -295,6 +295,23 @@ grep -q "next-disc fetch FAILED (disc 1 still missing)" "$APP/romm.log" 2>/dev/n
 [ -f "/run/muos/storage/save/file/Genesis Plus GX/Grandia (USA).srm" ] \
 	&& { echo "FAIL: launcher ran with disc 1 missing (black screen shipped)"; fails=$((fails+1)); } \
 	|| echo "ok: no hand-off with disc 1 missing (honest abort)"
+# (c) CRLF + comment .m3u, ALL discs present -> parses clean: NO phantom "incomplete",
+#     no fetch attempt, straight hand-off. Before the CR-strip fix every entry failed
+#     the [ -s ] check (trailing \r) so complete games silently never launched.
+mkdir -p "$MDGG/Wild Arms (USA)"
+printf '#EXTM3U\r\n# burned on Windows\r\nWild Arms (USA)/Wild Arms (USA) (Disc 1).chd\r\nWild Arms (USA)/Wild Arms (USA) (Disc 2).chd\r\n' > "$MDGG/Wild Arms (USA).m3u"
+echo DISC1 > "$MDGG/Wild Arms (USA)/Wild Arms (USA) (Disc 1).chd"
+echo DISC2 > "$MDGG/Wild Arms (USA)/Wild Arms (USA) (Disc 2).chd"
+_fetchlogs_before=$(grep -c "next-disc fetch" "$APP/romm.log" 2>/dev/null || echo 0)
+( cd / && "$OV" "Wild Arms" "genesis_plus_gx_libretro.so" "$MDGG/Wild Arms (USA).m3u" ); rc=$?
+[ "$rc" = 0 ] && echo "ok: override rc=0 on complete CRLF m3u" || { echo "FAIL: override rc=$rc on complete CRLF m3u"; fails=$((fails+1)); }
+[ -s "/run/muos/storage/save/file/Genesis Plus GX/Wild Arms (USA).srm" ] \
+	&& echo "ok: hand-off happened (CRLF+comment m3u parsed clean)" \
+	|| { echo "FAIL: complete CRLF m3u blocked the launch (CR/comment parse regression)"; fails=$((fails+1)); }
+_fetchlogs_after=$(grep -c "next-disc fetch" "$APP/romm.log" 2>/dev/null || echo 0)
+[ "$_fetchlogs_after" = "$_fetchlogs_before" ] \
+	&& echo "ok: no fetch attempted for the complete CRLF set" \
+	|| { echo "FAIL: complete CRLF m3u treated as incomplete"; fails=$((fails+1)); }
 
 echo
 echo "===== TEST 4: wizard --capture renders every screen to PNG (no fb, no input) ====="

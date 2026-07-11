@@ -15,8 +15,8 @@ POLL=60
 INTERVAL="${ROMM_SYNC_INTERVAL:-1800}"   # act at most every 30 min
 last_attempt=$(date +%s)
 
-# Never leave the radio up if we're killed mid-cycle.
-trap 'rm -f "$INGAME_LOCK" 2>/dev/null' EXIT INT TERM HUP QUIT
+# Drop the transfer mutex on any exit (owner-scoped: no-op unless this cycle holds it).
+trap 'wifi_release' EXIT INT TERM HUP QUIT
 
 # prefetch_work - OFFLINE census (engine --prefetch-discs --dry: manifest walk + file
 # stats, no config/host/network): are there downloaded multi-disc games with missing
@@ -41,12 +41,20 @@ while :; do
 	# game is waiting on discs (both checks are offline file reads).
 	if [ ! -s "$PENDING" ] && ! prefetch_work; then last_attempt=$(date +%s); continue; fi
 
+	# Transfer mutex FIRST (bg: the daemon never preempts a user action). BUSY must NOT
+	# consume the timer — a sync IS happening, just not ours; retry next poll.
+	wifi_acquire bg; acq=$?
+	if [ "$acq" = 2 ]; then
+		log "transfer mutex busy (another actor); retry next poll"
+		continue
+	fi
 	last_attempt=$(date +%s)
 	if wifi_bring_up; then
 		set_clock_bounded
 		lodor_ensure_device
 		out="$("$BIN" --push-pending 2>&1)"; rc=$?
 		printf '%s\n' "$out" >> "$LOG"
+		wifi_lock_refresh   # long cycle: keep the held lock's ts fresh between engine calls
 		# Handoff v1: also drain the offline pending-STATES queue (savestates). The launch
 		# hooks queue states on-exit; only this daemon drains them offline. Best-effort — a
 		# stuck state must never wedge the save flush above.
@@ -56,11 +64,20 @@ while :; do
 		# link (launches fetch disc-1-first; this makes mid-game disc swaps work without
 		# a relaunch). Best-effort, quietly logged; failures re-surface next census.
 		if [ "${LODOR_PREFETCH_DISCS:-on}" != "off" ]; then
-			( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (prefetch)"; "$BIN" --prefetch-discs ) >> "$LOG" 2>&1 \
-				|| log "prefetch-discs failed (retry next interval)"
+			wifi_lock_refresh
+			# Re-check the in-game gate NOW: the queue drain above can run long, and a
+			# game may have started since the poll-top check — a heavy prefetch must
+			# never compete with a running game.
+			if not_in_game; then
+				( cd "$DATA_DIR" 2>/dev/null || log "WARN cd $DATA_DIR (prefetch)"; "$BIN" --prefetch-discs ) >> "$LOG" 2>&1 \
+					|| log "prefetch-discs failed (retry next interval)"
+			else
+				log "prefetch skipped: game started during the cycle"
+			fi
 		fi
 		log "push-pending + push-pending-states rc=$rc"
 	else
 		log "wifi unavailable; retry next interval"
 	fi
+	wifi_release
 done

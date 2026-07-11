@@ -208,6 +208,83 @@ wifi_bring_up() {
 	return 1
 }
 
+# --- transfer coordination mutex (ported from lodoros/nextui, liveness-correct) ----------
+# Serializes ENGINE TRANSFERS across the daemon, romm-run (the app path), and anything else
+# that syncs. Pure coordination — NO radio control (wifi_bring_up owns the network answer on
+# this lane). mkdir-atomic; fg preempts a preemptible (push) holder so a user action never
+# waits on a background save upload; bg (the daemon) never preempts and is never preempted.
+# Reclaim ONLY a dead/absent owner — a LIVE holder keeps the mutex no matter how old its ts
+# (long downloads are legitimate); the age constant is a tiebreak ONLY when kill -0 can't
+# answer (unparseable owner pid).
+_WIFI_LOCK="/tmp/romm-wifi.lock"
+_WIFI_STALE=180   # age tiebreak: only consulted when owner liveness is inconclusive
+
+# True while a LIVE actor holds the mutex (dead/absent-owner locks read as free).
+_actor_active() {
+	[ -d "$_WIFI_LOCK" ] || return 1
+	o=$(cat "$_WIFI_LOCK/owner" 2>/dev/null); t=$(cat "$_WIFI_LOCK/ts" 2>/dev/null || echo 0); n=$(date +%s)
+	case "$o" in
+		'') return 1 ;;
+		*[!0-9]*) [ $((n - t)) -le "$_WIFI_STALE" ] ;;
+		*) kill -0 "$o" 2>/dev/null ;;
+	esac
+}
+
+# wifi_acquire [mode]  mode: fg = user action (preempts a push holder) | push = post-game
+# save upload (preemptible by fg) | bg = daemon (default). Returns 0 = mutex held (caller
+# MUST wifi_release), 2 = busy (a live, non-preemptible holder). Never touches the radio.
+wifi_acquire() {
+	_acq_mode="${1:-bg}"
+	while :; do
+		if mkdir "$_WIFI_LOCK" 2>/dev/null; then
+			echo "$$" > "$_WIFI_LOCK/owner"; date +%s > "$_WIFI_LOCK/ts"
+			if [ "$_acq_mode" = push ]; then echo 1 > "$_WIFI_LOCK/preempt"; else rm -f "$_WIFI_LOCK/preempt" 2>/dev/null; fi
+			[ "$(cat "$_WIFI_LOCK/owner" 2>/dev/null)" = "$$" ] && break
+			continue   # reclaimed during our setup window — re-evaluate
+		fi
+		owner=$(cat "$_WIFI_LOCK/owner" 2>/dev/null)
+		ts=$(cat "$_WIFI_LOCK/ts" 2>/dev/null || echo 0); now=$(date +%s)
+		_reclaim=0
+		case "$owner" in
+			'') _reclaim=1 ;;                                                   # absent owner
+			*[!0-9]*) [ $((now - ts)) -gt "$_WIFI_STALE" ] && _reclaim=1 ;;     # unparseable: age tiebreak
+			*) kill -0 "$owner" 2>/dev/null || _reclaim=1 ;;                    # parseable: liveness decides
+		esac
+		if [ "$_reclaim" = 1 ]; then
+			rm -f "$_WIFI_LOCK/owner" "$_WIFI_LOCK/ts" "$_WIFI_LOCK/preempt" 2>/dev/null
+			rmdir "$_WIFI_LOCK" 2>/dev/null
+			continue   # retry the atomic mkdir; if we lose, we re-evaluate the new owner
+		fi
+		if [ "$_acq_mode" = fg ] && [ "$(cat "$_WIFI_LOCK/preempt" 2>/dev/null)" = 1 ]; then
+			log "mutex PREEMPT push owner=$owner (fg incoming)"
+			kill -TERM "-$owner" 2>/dev/null || kill -TERM "$owner" 2>/dev/null
+			j=0; while kill -0 "$owner" 2>/dev/null && [ "$j" -lt 30 ]; do sleep 0.1; j=$((j + 1)); done
+			continue   # holder dying -> loop reclaims the now-free lock
+		fi
+		log "wifi_acquire BUSY owner=$owner mode=$_acq_mode"
+		return 2
+	done
+	return 0
+}
+
+# wifi_release — drop the mutex ONLY (owner-scoped: a trap/racer never disturbs another
+# actor's transfer). Never touches the radio.
+wifi_release() {
+	if [ "$(cat "$_WIFI_LOCK/owner" 2>/dev/null)" = "$$" ]; then
+		rm -f "$_WIFI_LOCK/owner" "$_WIFI_LOCK/ts" "$_WIFI_LOCK/preempt" 2>/dev/null
+		rmdir "$_WIFI_LOCK" 2>/dev/null
+	fi
+	return 0
+}
+
+# wifi_lock_refresh — bump the held lock's ts (owner-scoped; no-op otherwise). Long-cycle
+# holders (the daemon between engine calls) call this so a reader that can't verify our
+# liveness (unparseable-owner tiebreak) never mistakes a working holder for a stale one.
+wifi_lock_refresh() {
+	[ "$(cat "$_WIFI_LOCK/owner" 2>/dev/null)" = "$$" ] && date +%s > "$_WIFI_LOCK/ts" 2>/dev/null
+	return 0
+}
+
 # lodor_ensure_device - quiet first-run heal (ported from Knulli, 6b29c2c): a preseeded or
 # card-cloned config carries a token but NO device_id (the release device-state strip is
 # the contract), and every save-sync engine mode hard-requires one - so saves would
