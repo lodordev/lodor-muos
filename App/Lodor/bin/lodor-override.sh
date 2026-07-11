@@ -197,12 +197,15 @@ fi
 # gate than the game needs); a missing disc 1 with no way to fetch it is the same honest
 # abort as an unfilled stub. Skipped when step 1 just filled the stub (disc 1 landed this
 # launch — one disc per launch is the design).
+# The per-game disc folder is DOT-HIDDEN (".<Game>/", lodor#7 UX fix); legacy
+# non-dot folders and already-dot names both map: raw name, then dot-stripped.
 lodor_m3u_for() {
 	case "$1" in
 		*.m3u) printf '%s' "$1"; return 0 ;;
 	esac
 	_gd=$(dirname "$1"); _pd=$(dirname "$_gd"); _gn=$(basename "$_gd")
 	_cand="$_pd/$_gn.m3u"
+	[ -f "$_cand" ] || _cand="$_pd/${_gn#.}.m3u"
 	[ -f "$_cand" ] && printf '%s' "$_cand"
 }
 # 0 (true) if the engine's OFFLINE completeness gate says the disc set is incomplete

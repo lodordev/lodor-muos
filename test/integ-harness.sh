@@ -312,6 +312,25 @@ _fetchlogs_after=$(grep -c "next-disc fetch" "$APP/romm.log" 2>/dev/null || echo
 [ "$_fetchlogs_after" = "$_fetchlogs_before" ] \
 	&& echo "ok: no fetch attempted for the complete CRLF set" \
 	|| { echo "FAIL: complete CRLF m3u treated as incomplete"; fails=$((fails+1)); }
+# (d) DOT-HIDDEN disc folder (lodor#7 UX fix): the engine now writes discs into
+#     ".<Game>/" with ".<Game>/…" m3u lines (the folder stays out of launchers' game
+#     lists). A complete dot-layout set must parse clean end-to-end — real-engine
+#     --check-rom census included — with no fetch attempt and a normal hand-off.
+mkdir -p "$MDGG/.Star Ocean 2 (USA)"
+printf '%s\n%s\n' ".Star Ocean 2 (USA)/Star Ocean 2 (USA) (Disc 1).chd" \
+	".Star Ocean 2 (USA)/Star Ocean 2 (USA) (Disc 2).chd" > "$MDGG/Star Ocean 2 (USA).m3u"
+echo DISC1 > "$MDGG/.Star Ocean 2 (USA)/Star Ocean 2 (USA) (Disc 1).chd"
+echo DISC2 > "$MDGG/.Star Ocean 2 (USA)/Star Ocean 2 (USA) (Disc 2).chd"
+_fetchlogs_before=$(grep -c "next-disc fetch" "$APP/romm.log" 2>/dev/null || echo 0)
+( cd / && "$OV" "Star Ocean 2" "genesis_plus_gx_libretro.so" "$MDGG/Star Ocean 2 (USA).m3u" ); rc=$?
+[ "$rc" = 0 ] && echo "ok: override rc=0 on complete dot-layout m3u" || { echo "FAIL: override rc=$rc on complete dot-layout m3u"; fails=$((fails+1)); }
+[ -s "/run/muos/storage/save/file/Genesis Plus GX/Star Ocean 2 (USA).srm" ] \
+	&& echo "ok: hand-off happened (dot-layout m3u parsed clean)" \
+	|| { echo "FAIL: complete dot-layout m3u blocked the launch (dot-line resolve regression)"; fails=$((fails+1)); }
+_fetchlogs_after=$(grep -c "next-disc fetch" "$APP/romm.log" 2>/dev/null || echo 0)
+[ "$_fetchlogs_after" = "$_fetchlogs_before" ] \
+	&& echo "ok: no fetch attempted for the complete dot-layout set" \
+	|| { echo "FAIL: complete dot-layout m3u treated as incomplete"; fails=$((fails+1)); }
 
 echo
 echo "===== TEST 4: wizard --capture renders every screen to PNG (no fb, no input) ====="
